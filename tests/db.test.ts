@@ -57,6 +57,19 @@ describe("Database (durable path)", () => {
     expect(() => db.exec("COMMIT")).toThrow(TransactionError); // nothing to commit
   });
 
+  it("rejects an invalid CREATE TABLE without corrupting later committed tables", () => {
+    expect(() => db.exec("CREATE TABLE bad (a INT NOT NULL, a INT NOT NULL)")).toThrow();
+
+    db.exec("CREATE TABLE good (id INT NOT NULL)");
+    db.exec("INSERT INTO good (id) VALUES (1), (2)");
+    db.close();
+
+    db = Database.open(tmp.path);
+    expect(db.tableNames()).toContain("good");
+    expect(db.tableNames()).not.toContain("bad");
+    expect(rows(db.exec("SELECT id FROM good ORDER BY id"))).toEqual([[1n], [2n]]);
+  });
+
   it("keeps the heap chain reachable after rolling back chain growth", () => {
     db.exec("CREATE TABLE big (id INT NOT NULL, body TEXT)");
     const body = "x".repeat(300); // a few dozen rows per page -> forces new pages

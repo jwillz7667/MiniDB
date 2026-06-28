@@ -28,7 +28,12 @@ export function makeEngine(tmp: TempDb = makeTempDb(), poolSize = 64): TestEngin
   const pool = new BufferPool(pager, poolSize);
   const tx = new DirectTx(pool);
   const heap = new Heap();
+  const fresh = pager.getCatalogRoot() === 0;
   const catalog = Catalog.open(tx, pager, heap);
+  if (fresh) {
+    pool.flushAll();
+    pager.setCatalogRoot(catalog.rootPage());
+  }
   const ctx: ExecContext = {
     tx,
     catalog,

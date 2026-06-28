@@ -73,7 +73,14 @@ export class Database {
     // Bootstrap/load the catalog directly (the cold-start path is fsync'd, not
     // logged); subsequent DDL/DML go through the WAL.
     const catalog = Catalog.open(new DirectTx(pool), pager, heap);
-    if (fresh) pool.flushAll();
+    if (fresh) {
+      // Order matters: make the catalog pages durable, THEN record the header
+      // pointer to them. A crash before the pointer is written simply re-runs a
+      // fresh bootstrap; the reverse order could point the header at unwritten
+      // pages and leave the database unopenable.
+      pool.flushAll();
+      pager.setCatalogRoot(catalog.rootPage());
+    }
 
     const store = new TableStore(catalog, heap);
     const rowids = new RowIdAllocator();

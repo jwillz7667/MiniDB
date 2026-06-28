@@ -84,15 +84,24 @@ export class Catalog {
   static open(tx: Tx, pager: Pager, heap: Heap): Catalog {
     const existingRoot = pager.getCatalogRoot();
     return existingRoot === INVALID_PAGE
-      ? Catalog.bootstrap(tx, pager, heap)
+      ? Catalog.bootstrap(tx, heap)
       : Catalog.load(tx, heap, existingRoot);
   }
 
-  private static bootstrap(tx: Tx, pager: Pager, heap: Heap): Catalog {
+  /**
+   * Heap root of minidb_tables. After a fresh bootstrap the CALLER persists this
+   * into the header via `pager.setCatalogRoot` — but only AFTER flushing the
+   * catalog pages, so the header pointer never reaches disk before the pages it
+   * references (which would leave the database permanently unopenable).
+   */
+  rootPage(): number {
+    return this.tablesRoot;
+  }
+
+  private static bootstrap(tx: Tx, heap: Heap): Catalog {
     const tablesRoot = heap.create(tx);
     const columnsRoot = heap.create(tx);
     const indexesRoot = heap.create(tx);
-    pager.setCatalogRoot(tablesRoot);
 
     const cat = new Catalog(heap, tablesRoot, columnsRoot, indexesRoot);
     cat.writeTableRow(tx, TABLES, tablesRoot, INVALID_PAGE);
@@ -192,6 +201,9 @@ export class Catalog {
       throw new CatalogError(`table "${name}" already exists`);
     }
     if (columns.length === 0) throw new CatalogError(`table "${name}" needs at least one column`);
+    // Validate the column list (duplicate names, etc.) BEFORE writing anything,
+    // so a bad definition never leaves half-written catalog rows behind.
+    const schema = makeSchema(columns);
 
     const heapRoot = this.heap.create(tx);
     const pkRoot = BTree.create(tx);
@@ -207,7 +219,7 @@ export class Catalog {
       this.heap.insert(tx, this.columnsRoot, serialize(COLUMNS_SCHEMA, row));
     });
 
-    const meta: TableMeta = { name, heapRoot, pkRoot, columns, schema: makeSchema(columns) };
+    const meta: TableMeta = { name, heapRoot, pkRoot, columns, schema };
     this.tables.set(name.toLowerCase(), meta);
     return meta;
   }

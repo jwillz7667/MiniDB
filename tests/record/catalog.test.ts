@@ -44,6 +44,7 @@ describe("Catalog", () => {
     expect(meta.pkRoot).toBeGreaterThan(0);
 
     const path = s.tmp.path;
+    s.pager.setCatalogRoot(cat.rootPage()); // caller persists the root after bootstrap
     s.flushClose();
 
     const pager = Pager.open(path);
@@ -79,6 +80,7 @@ describe("Catalog", () => {
     expect(() => cat.createIndex(s.tx, "users", "nope", 9)).toThrow(CatalogError); // bad column
 
     const path = s.tmp.path;
+    s.pager.setCatalogRoot(cat.rootPage()); // caller persists the root after bootstrap
     s.flushClose();
 
     const pager = Pager.open(path);
