@@ -183,6 +183,8 @@ export function printExpr(expr: Expr): string {
   switch (expr.kind) {
     case "literal":
       return valueToLiteral(expr.value);
+    case "param":
+      return `?${expr.index + 1}`;
     case "column":
       return expr.name;
     case "compare":

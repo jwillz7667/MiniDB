@@ -1,8 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import { ParseError } from "../../src/errors.js";
-import type { CreateTableStmt, DeleteStmt, InsertStmt, SelectStmt } from "../../src/sql/ast.js";
+import type {
+  CreateTableStmt,
+  DeleteStmt,
+  InsertStmt,
+  LiteralExpr,
+  LiteralValue,
+  SelectStmt,
+} from "../../src/sql/ast.js";
 import { parse } from "../../src/sql/parser.js";
+
+const lit = (value: LiteralValue): LiteralExpr => ({ kind: "literal", value });
 
 describe("parser", () => {
   it("parses CREATE TABLE with types and NOT NULL", () => {
@@ -32,16 +41,25 @@ describe("parser", () => {
     ) as InsertStmt;
     expect(stmt.table).toBe("users");
     expect(stmt.columns).toEqual(["id", "name", "active"]);
+    // Rows are value expressions (literal or `?` placeholder) resolved at bind time.
     expect(stmt.rows).toEqual([
-      [1n, "ann", true],
-      [2n, "bob", false],
+      [lit(1n), lit("ann"), lit(true)],
+      [lit(2n), lit("bob"), lit(false)],
     ]);
   });
 
   it("parses negative integers and NULL literals", () => {
     const stmt = parse("INSERT INTO t VALUES (-5, NULL)") as InsertStmt;
     expect(stmt.columns).toBeNull();
-    expect(stmt.rows).toEqual([[-5n, null]]);
+    expect(stmt.rows).toEqual([[lit(-5n), lit(null)]]);
+  });
+
+  it("parses `?` placeholders into positional param nodes", () => {
+    const stmt = parse("INSERT INTO t (a, b) VALUES (?, ?), (?, 9)") as InsertStmt;
+    expect(stmt.rows).toEqual([
+      [{ kind: "param", index: 0 }, { kind: "param", index: 1 }],
+      [{ kind: "param", index: 2 }, lit(9n)],
+    ]);
   });
 
   it("parses SELECT with WHERE, ORDER BY, and LIMIT", () => {

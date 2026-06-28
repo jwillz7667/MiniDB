@@ -9,9 +9,31 @@ import type {
   LiteralValue,
   SelectStmt,
   Statement,
+  ValueExpr,
 } from "./ast.js";
 import { tokenize } from "./lexer.js";
 import type { Token, TokenType } from "./token.js";
+
+/** A parsed statement together with the number of `?` placeholders it carries. */
+export interface ParsedStatement {
+  readonly statement: Statement;
+  readonly paramCount: number;
+}
+
+/**
+ * Parse exactly one statement and report its placeholder count, for the
+ * prepared-statement path (`Database.prepare`). The returned AST may contain
+ * `param` nodes; `bindStatement` substitutes them before planning.
+ */
+export function parsePrepared(sql: string): ParsedStatement {
+  const parser = new Parser(tokenize(sql));
+  const statements = parser.parseProgram();
+  if (statements.length === 0) throw new ParseError("empty statement", 1, 1);
+  if (statements.length > 1) {
+    throw new ParseError(`expected a single statement but found ${statements.length}`, 1, 1);
+  }
+  return { statement: statements[0]!, paramCount: parser.paramCount };
+}
 
 const COMPARE_OPS: ReadonlySet<string> = new Set(["=", "!=", "<", "<=", ">", ">="]);
 const COLUMN_TYPES: ReadonlySet<string> = new Set(["INT", "TEXT", "BOOL"]);
@@ -33,8 +55,14 @@ export function parseMany(sql: string): Statement[] {
 
 class Parser {
   private pos = 0;
+  private params = 0;
 
   constructor(private readonly tokens: Token[]) {}
+
+  /** Number of `?` placeholders seen so far (final value after parsing). */
+  get paramCount(): number {
+    return this.params;
+  }
 
   parseProgram(): Statement[] {
     const out: Statement[] = [];
@@ -190,12 +218,12 @@ class Parser {
     }
 
     this.expectKeyword("VALUES");
-    const rows: LiteralValue[][] = [];
+    const rows: ValueExpr[][] = [];
     do {
       this.expect("punctuation", "(", '"(" before a value tuple');
-      const values: LiteralValue[] = [];
+      const values: ValueExpr[] = [];
       do {
-        values.push(this.parseLiteralValue());
+        values.push(this.parseValueExpr());
       } while (this.match("punctuation", ","));
       this.expect("punctuation", ")", '")" after a value tuple');
       rows.push(values);
@@ -295,8 +323,21 @@ class Parser {
       this.expect("punctuation", ")", '")" to close a grouped expression');
       return expr;
     }
+    if (this.check("punctuation", "?")) {
+      this.advance();
+      return { kind: "param", index: this.params++ };
+    }
     if (this.check("identifier")) {
       return { kind: "column", name: this.advance().value };
+    }
+    return { kind: "literal", value: this.parseLiteralValue() };
+  }
+
+  /** A literal or a `?` placeholder, for value positions (INSERT/UPDATE). */
+  private parseValueExpr(): ValueExpr {
+    if (this.check("punctuation", "?")) {
+      this.advance();
+      return { kind: "param", index: this.params++ };
     }
     return { kind: "literal", value: this.parseLiteralValue() };
   }

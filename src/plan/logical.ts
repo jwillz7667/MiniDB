@@ -2,7 +2,14 @@ import { INVALID_PAGE } from "../constants.js";
 import { PlanError } from "../errors.js";
 import type { Catalog, TableMeta } from "../record/catalog.js";
 import { columnIndex, type Schema, type Value } from "../record/schema.js";
-import type { DeleteStmt, Expr, InsertStmt, SelectStmt, SortDir } from "../sql/ast.js";
+import type {
+  DeleteStmt,
+  Expr,
+  InsertStmt,
+  SelectStmt,
+  SortDir,
+  ValueExpr,
+} from "../sql/ast.js";
 
 /**
  * The logical plan: a tree describing WHAT to compute, independent of access
@@ -83,6 +90,8 @@ function validateExpr(expr: Expr, schema: Schema): void {
   switch (expr.kind) {
     case "literal":
       return;
+    case "param":
+      throw new PlanError("unbound parameter in query (use a prepared statement)");
     case "column":
       columnIndex(schema, expr.name); // throws if unknown
       return;
@@ -135,14 +144,15 @@ export function buildInsert(stmt: InsertStmt, catalog: Catalog): LogicalInsert {
     }
   });
 
-  const rows = stmt.rows.map((literals) => {
-    if (literals.length !== targetNames.length) {
+  const rows = stmt.rows.map((items) => {
+    if (items.length !== targetNames.length) {
       throw new PlanError(
-        `INSERT has ${literals.length} values for ${targetNames.length} columns`,
+        `INSERT has ${items.length} values for ${targetNames.length} columns`,
       );
     }
     const full: Value[] = table.columns.map(() => null);
-    literals.forEach((value, j) => {
+    items.forEach((item, j) => {
+      const value = literalOf(item);
       const schemaIdx = targetIndices[j]!;
       checkValueType(table, schemaIdx, value);
       full[schemaIdx] = value;
@@ -163,6 +173,14 @@ export function buildDelete(stmt: DeleteStmt, catalog: Catalog): LogicalDelete {
     input = { kind: "filter", predicate: stmt.where, input };
   }
   return { kind: "delete", table, input };
+}
+
+/** Extract the literal value from an INSERT value slot (params are bound earlier). */
+function literalOf(item: ValueExpr): Value {
+  if (item.kind === "param") {
+    throw new PlanError("unbound parameter in INSERT (use a prepared statement)");
+  }
+  return item.value;
 }
 
 function checkValueType(table: TableMeta, schemaIdx: number, value: Value): void {
