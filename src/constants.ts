@@ -6,12 +6,21 @@
 /** Size of one page on disk and in memory. The whole engine is built around this. */
 export const PAGE_SIZE = 4096;
 
+/**
+ * Every page reserves its last 4 bytes for a CRC32 the pager writes and verifies,
+ * so torn writes and bit-rot are caught instead of silently read as data. Access
+ * methods must treat USABLE_PAGE_SIZE as the page's content area.
+ */
+export const PAGE_CHECKSUM_SIZE = 4;
+export const USABLE_PAGE_SIZE = PAGE_SIZE - PAGE_CHECKSUM_SIZE;
+export const PAGE_CHECKSUM_OFFSET = USABLE_PAGE_SIZE;
+
 /** Magic string at the start of page 0. Identifies a file as a minidb database. */
 export const MAGIC = "MNDB";
 export const MAGIC_BYTES = 4;
 
 /** On-disk format version, stored in the header so future changes can be detected. */
-export const DB_FORMAT_VERSION = 1;
+export const DB_FORMAT_VERSION = 2;
 
 /**
  * Page 0 header layout. Page 0 is reserved for this header and is never used as a

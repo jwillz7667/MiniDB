@@ -14,3 +14,7 @@ coverage/
 .idea/
 .vscode/
 *.tsbuildinfo
+
+db-engine-spec.md
+
+docs/

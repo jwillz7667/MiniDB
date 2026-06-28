@@ -20,9 +20,12 @@ import {
   INVALID_PAGE,
   MAGIC,
   MAGIC_BYTES,
+  PAGE_CHECKSUM_OFFSET,
   PAGE_SIZE,
+  USABLE_PAGE_SIZE,
 } from "../constants.js";
 import { CorruptDatabaseError, PageError } from "../errors.js";
+import { crc32 } from "./crc32.js";
 
 /**
  * The lowest layer: turns one file into a sequence of fixed-size pages. Page 0
@@ -57,6 +60,7 @@ export class Pager {
       header.writeUInt32LE(1, HEADER_PAGE_COUNT_OFFSET); // page 0 only
       header.writeUInt32LE(INVALID_PAGE, HEADER_CATALOG_ROOT_OFFSET);
       header.writeBigUInt64LE(1n, HEADER_NEXT_TXID_OFFSET); // txids start at 1
+      stampChecksum(header);
       writeSync(fd, header, 0, PAGE_SIZE, 0);
       fsyncSync(fd);
       return new Pager(fd, path, header, 1);
@@ -71,12 +75,23 @@ export class Pager {
         `not a minidb file: expected magic "${MAGIC}", found "${magic}"`,
       );
     }
+    const storedVersion = header.readUInt16LE(HEADER_VERSION_OFFSET);
+    if (storedVersion !== DB_FORMAT_VERSION) {
+      closeSync(fd);
+      throw new CorruptDatabaseError(
+        `format version mismatch: file is v${storedVersion}, engine is v${DB_FORMAT_VERSION}`,
+      );
+    }
     const storedPageSize = header.readUInt16LE(HEADER_PAGE_SIZE_OFFSET);
     if (storedPageSize !== PAGE_SIZE) {
       closeSync(fd);
       throw new CorruptDatabaseError(
         `page size mismatch: file uses ${storedPageSize}, engine uses ${PAGE_SIZE}`,
       );
+    }
+    if (!verifyChecksum(header)) {
+      closeSync(fd);
+      throw new CorruptDatabaseError("database header failed its checksum (file corrupt)");
     }
 
     // Drop any torn trailing page left by a crash mid-allocation; recovery will
@@ -108,10 +123,7 @@ export class Pager {
     this.assertPage(pageNo);
     if (pageNo === 0) return Buffer.from(this.header);
     const page = Buffer.alloc(PAGE_SIZE);
-    const read = readSync(this.fd, page, 0, PAGE_SIZE, pageNo * PAGE_SIZE);
-    if (read !== PAGE_SIZE) {
-      throw new PageError(`short read on page ${pageNo}: ${read}/${PAGE_SIZE} bytes`);
-    }
+    this.readVerified(pageNo, page);
     return page;
   }
 
@@ -125,21 +137,30 @@ export class Pager {
       this.header.copy(into);
       return;
     }
+    this.readVerified(pageNo, into);
+  }
+
+  private readVerified(pageNo: number, into: Buffer): void {
     const read = readSync(this.fd, into, 0, PAGE_SIZE, pageNo * PAGE_SIZE);
     if (read !== PAGE_SIZE) {
       throw new PageError(`short read on page ${pageNo}: ${read}/${PAGE_SIZE} bytes`);
     }
+    if (!verifyChecksum(into)) {
+      throw new CorruptDatabaseError(`page ${pageNo} failed its checksum (torn write or bit-rot)`);
+    }
   }
 
   /**
-   * Write a page. By default does not fsync (see class note). Page 0 writes go
-   * through `writeHeader`/header setters instead and are not expected here.
+   * Write a page (stamping its checksum first). By default does not fsync (see
+   * class note). Page 0 writes go through `writeHeader`/header setters instead
+   * and are not expected here.
    */
   writePage(pageNo: number, page: Buffer, sync = false): void {
     this.assertPage(pageNo);
     if (page.length !== PAGE_SIZE) {
       throw new PageError(`page buffer must be ${PAGE_SIZE} bytes, got ${page.length}`);
     }
+    stampChecksum(page);
     if (pageNo === 0) {
       page.copy(this.header);
     }
@@ -174,6 +195,7 @@ export class Pager {
 
   /** Persist the in-memory header page to disk and fsync. */
   private writeHeader(): void {
+    stampChecksum(this.header);
     writeSync(this.fd, this.header, 0, PAGE_SIZE, 0);
     fsyncSync(this.fd);
   }
@@ -201,6 +223,7 @@ export class Pager {
   /** fsync the data file. Called once after a batch of page writes. */
   sync(): void {
     // Keep the persisted page count current before forcing the file down.
+    stampChecksum(this.header);
     writeSync(this.fd, this.header, 0, PAGE_SIZE, 0);
     fsyncSync(this.fd);
   }
@@ -209,4 +232,25 @@ export class Pager {
     this.sync();
     closeSync(this.fd);
   }
+}
+
+/** Write a page's CRC32 (over its content area) into its reserved trailer. */
+function stampChecksum(page: Buffer): void {
+  page.writeUInt32LE(crc32(page, 0, USABLE_PAGE_SIZE), PAGE_CHECKSUM_OFFSET);
+}
+
+/**
+ * Verify a page's checksum. A brand-new, never-written page is all zeros (from
+ * ftruncate) — treated as a valid uninitialized page so a freshly allocated
+ * page can be read before its first write.
+ */
+function verifyChecksum(page: Buffer): boolean {
+  const stored = page.readUInt32LE(PAGE_CHECKSUM_OFFSET);
+  if (stored === crc32(page, 0, USABLE_PAGE_SIZE)) return true;
+  return isAllZero(page);
+}
+
+function isAllZero(page: Buffer): boolean {
+  for (let i = 0; i < page.length; i++) if (page[i] !== 0) return false;
+  return true;
 }

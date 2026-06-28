@@ -1,4 +1,4 @@
-import { PAGE_SIZE } from "../constants.js";
+import { USABLE_PAGE_SIZE } from "../constants.js";
 import { SlottedPageError } from "../errors.js";
 
 /**
@@ -22,12 +22,14 @@ const SLOT_OFFSET_FIELD = 0;
 const SLOT_LENGTH_FIELD = 2;
 
 /** Largest record that can ever fit in an empty page (header + one slot reserved). */
-export const MAX_RECORD_SIZE = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
+export const MAX_RECORD_SIZE = USABLE_PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
 
 /** Initialize `page` as an empty slotted page linked to `nextPage`. */
 export function initSlottedPage(page: Buffer, nextPage = 0): void {
   page.writeUInt16LE(0, SLOT_COUNT_OFFSET);
-  page.writeUInt16LE(PAGE_SIZE, FREE_START_OFFSET);
+  // Records grow down from the end of the content area, never into the pager's
+  // checksum trailer.
+  page.writeUInt16LE(USABLE_PAGE_SIZE, FREE_START_OFFSET);
   page.writeUInt32LE(nextPage, NEXT_PAGE_OFFSET);
 }
 

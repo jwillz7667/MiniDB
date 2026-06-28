@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { PAGE_SIZE } from "../../src/constants.js";
+import { USABLE_PAGE_SIZE } from "../../src/constants.js";
 import { BufferPoolError } from "../../src/errors.js";
 import { BufferPool } from "../../src/storage/bufferpool.js";
 import { Pager } from "../../src/storage/pager.js";
@@ -27,7 +27,8 @@ describe("BufferPool", () => {
       const pageNo = pool.allocatePage();
       const page = pool.fetchPage(pageNo);
       page.writeUInt32LE(pageNo, 0);
-      page.fill(pageNo & 0xff, 4);
+      // Stamp only the content area; the pager owns the checksum trailer.
+      page.fill(pageNo & 0xff, 4, USABLE_PAGE_SIZE);
       pool.unpin(pageNo, true);
       nums.push(pageNo);
     }
@@ -44,7 +45,7 @@ describe("BufferPool", () => {
       const page = pool.fetchPage(pageNo);
       expect(page.readUInt32LE(0)).toBe(pageNo);
       expect(page[4]).toBe(pageNo & 0xff);
-      expect(page[PAGE_SIZE - 1]).toBe(pageNo & 0xff);
+      expect(page[USABLE_PAGE_SIZE - 1]).toBe(pageNo & 0xff);
       pool.unpin(pageNo, false);
     }
   });

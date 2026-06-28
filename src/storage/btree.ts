@@ -1,4 +1,4 @@
-import { NODE_INTERNAL, NODE_LEAF, PAGE_SIZE } from "../constants.js";
+import { NODE_INTERNAL, NODE_LEAF, USABLE_PAGE_SIZE } from "../constants.js";
 import { BTreeError } from "../errors.js";
 import type { Rid } from "./rid.js";
 import type { Tx } from "./tx.js";
@@ -32,9 +32,9 @@ const INTERNAL_ENTRIES_OFFSET = 7; // 1 + 2 + 4
 const INTERNAL_ENTRY_SIZE = 18; // i64 + u32 + u16 + u32
 
 /** Max entries that fit in a leaf / max separators that fit in an internal node. */
-export const LEAF_CAPACITY = Math.floor((PAGE_SIZE - LEAF_ENTRIES_OFFSET) / LEAF_ENTRY_SIZE);
+export const LEAF_CAPACITY = Math.floor((USABLE_PAGE_SIZE - LEAF_ENTRIES_OFFSET) / LEAF_ENTRY_SIZE);
 export const INTERNAL_CAPACITY = Math.floor(
-  (PAGE_SIZE - INTERNAL_ENTRIES_OFFSET) / INTERNAL_ENTRY_SIZE,
+  (USABLE_PAGE_SIZE - INTERNAL_ENTRIES_OFFSET) / INTERNAL_ENTRY_SIZE,
 );
 
 /** Smallest / largest possible rid, used to turn a key span into a composite span. */

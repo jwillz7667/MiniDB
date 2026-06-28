@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { PAGE_SIZE } from "../../src/constants.js";
+import { PAGE_SIZE, USABLE_PAGE_SIZE } from "../../src/constants.js";
 import { SlottedPageError } from "../../src/errors.js";
 import {
   canInsert,
@@ -59,7 +59,7 @@ describe("slotted page", () => {
 
   it("reports free space and refuses records that do not fit", () => {
     const page = newPage();
-    expect(freeSpace(page)).toBe(PAGE_SIZE - 8); // header is 8 bytes
+    expect(freeSpace(page)).toBe(USABLE_PAGE_SIZE - 8); // header is 8 bytes; trailer reserved
 
     const big = Buffer.alloc(MAX_RECORD_SIZE);
     expect(canInsert(page, big.length)).toBe(true);
