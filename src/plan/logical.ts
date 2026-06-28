@@ -2,6 +2,7 @@ import { INVALID_PAGE } from "../constants.js";
 import { PlanError } from "../errors.js";
 import type { Catalog, TableMeta } from "../record/catalog.js";
 import { columnIndex, type Schema, type Value } from "../record/schema.js";
+import { coerceToColumnType } from "../record/value.js";
 import type {
   DeleteStmt,
   Expr,
@@ -226,11 +227,11 @@ function checkValueType(table: TableMeta, schemaIdx: number, value: Value): void
     if (!col.nullable) throw new PlanError(`column "${col.name}" is NOT NULL`);
     return;
   }
-  const ok =
-    (col.type === "INT" && typeof value === "bigint") ||
-    (col.type === "TEXT" && typeof value === "string") ||
-    (col.type === "BOOL" && typeof value === "boolean");
-  if (!ok) {
-    throw new PlanError(`column "${col.name}" expects ${col.type}, got ${typeof value}`);
+  // Validate (with numeric affinity) at plan time so a bad literal fails before
+  // any rows are written; the actual coercion happens again in serialize.
+  try {
+    coerceToColumnType(col.type, value, col.name);
+  } catch (err) {
+    throw new PlanError(err instanceof Error ? err.message : String(err));
   }
 }

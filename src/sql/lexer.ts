@@ -50,6 +50,27 @@ export function tokenize(source: string): Token[] {
       tokens.push({ type, value, line: startLine, column: startColumn });
     };
 
+    // Blob hex literal: X'48656c6c6f'. Must precede the identifier rule so a
+    // lone `x`/`X` followed by a quote is read as a blob, not an identifier.
+    if ((c === "X" || c === "x") && peek(1) === "'") {
+      advance(); // X / x
+      advance(); // opening quote
+      let hex = "";
+      for (;;) {
+        if (pos >= source.length) {
+          throw new LexError("unterminated blob literal", startLine, startColumn);
+        }
+        const ch = advance();
+        if (ch === "'") break;
+        hex += ch;
+      }
+      if (hex.length % 2 !== 0 || /[^0-9a-fA-F]/.test(hex)) {
+        throw new LexError(`invalid blob literal X'${hex}'`, startLine, startColumn);
+      }
+      push("blob", hex);
+      continue;
+    }
+
     // Identifier or keyword.
     if (isAlpha(c)) {
       let text = "";
@@ -60,14 +81,29 @@ export function tokenize(source: string): Token[] {
       continue;
     }
 
-    // Integer literal.
+    // Numeric literal: integer, or a float with a fraction and/or exponent.
     if (isDigit(c)) {
       let text = "";
+      let isFloat = false;
       while (pos < source.length && isDigit(peek())) text += advance();
+      if (peek() === "." && isDigit(peek(1))) {
+        isFloat = true;
+        text += advance(); // "."
+        while (pos < source.length && isDigit(peek())) text += advance();
+      }
+      if (peek() === "e" || peek() === "E") {
+        isFloat = true;
+        text += advance(); // "e" / "E"
+        if (peek() === "+" || peek() === "-") text += advance();
+        if (!isDigit(peek())) {
+          throw new LexError(`invalid exponent in number near "${text}"`, line, column);
+        }
+        while (pos < source.length && isDigit(peek())) text += advance();
+      }
       if (isAlpha(peek())) {
         throw new LexError(`invalid number literal near "${text}${peek()}"`, line, column);
       }
-      push("integer", text);
+      push(isFloat ? "float" : "integer", text);
       continue;
     }
 

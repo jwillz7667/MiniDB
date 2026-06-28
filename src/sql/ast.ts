@@ -1,7 +1,11 @@
 import type { ColumnType } from "../record/schema.js";
 
-/** A constant value that can appear in SQL. */
-export type LiteralValue = bigint | string | boolean | null;
+/**
+ * A constant value that can appear in SQL: an integer (`bigint`), a REAL
+ * (`number`), a string, a boolean, a blob literal (`Buffer`, via `X'..'`), a
+ * `Date` (only through a bound parameter), or NULL.
+ */
+export type LiteralValue = bigint | number | string | boolean | Buffer | Date | null;
 
 export type CompareOp = "=" | "!=" | "<" | "<=" | ">" | ">=";
 export type LogicalOp = "AND" | "OR";

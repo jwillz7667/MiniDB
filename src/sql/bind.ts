@@ -12,12 +12,13 @@ import type {
 } from "./ast.js";
 
 /**
- * Values a caller may bind to a `?` placeholder. JS `number` is accepted as a
- * convenience and coerced to a `bigint` when it is an exact integer (the engine
- * stores INT as bigint end to end); a non-integer number is rejected until a
- * floating type exists, so precision is never silently lost.
+ * Values a caller may bind to a `?` placeholder. An exact-integer JS `number` is
+ * normalized to `bigint` so it lines up with INT columns and index ranges; other
+ * numbers stay `number` (REAL). `Buffer`/`Uint8Array` bind to BLOB columns and
+ * `Date` to DATETIME columns. Final type checking happens per column when the
+ * value is written or compared.
  */
-export type BindValue = bigint | number | boolean | string | null;
+export type BindValue = bigint | number | boolean | string | Buffer | Date | null;
 
 /**
  * Substitute bound values for every `?` placeholder in a statement, producing a
@@ -43,17 +44,13 @@ export function bindStatement(
   return rewrite(stmt, literals);
 }
 
-/** Convert a caller-supplied bind value into an on-engine literal value. */
-function coerce(value: BindValue, i: number): LiteralValue {
-  if (typeof value === "number") {
-    if (!Number.isInteger(value)) {
-      throw new BindError(
-        `parameter ${i + 1} is the non-integer number ${value}; pass a bigint or string instead`,
-      );
-    }
-    return BigInt(value);
-  }
-  // bigint | boolean | string | null pass through unchanged.
+/**
+ * Normalize a caller-supplied bind value into a literal. An exact-integer number
+ * becomes a bigint (so it matches INT columns and indexes); everything else
+ * passes through and is range/type-checked later against the target column.
+ */
+function coerce(value: BindValue): LiteralValue {
+  if (typeof value === "number" && Number.isInteger(value)) return BigInt(value);
   return value;
 }
 

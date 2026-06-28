@@ -1,14 +1,18 @@
 import { U16, U64 } from "../constants.js";
 import { TupleError } from "../errors.js";
 import type { Row, Schema, Value } from "./schema.js";
+import { coerceToColumnType } from "./value.js";
 
 /**
  * Tuple (de)serialization. A row's bytes begin with a null-bitmap — ceil(n/8)
  * bytes, one bit per column, set ⇒ NULL — followed by each non-null column
  * packed by type:
- *   INT  → 8-byte little-endian signed integer (bigint)
- *   TEXT → u16 byte length, then UTF-8 bytes
- *   BOOL → 1 byte (0 or 1)
+ *   INT      → 8-byte little-endian signed integer (bigint)
+ *   REAL     → 8-byte little-endian IEEE-754 double
+ *   TEXT     → u16 byte length, then UTF-8 bytes
+ *   BOOL     → 1 byte (0 or 1)
+ *   BLOB     → u16 byte length, then raw bytes
+ *   DATETIME → 8-byte little-endian signed integer (epoch milliseconds)
  */
 
 function bitmapBytes(columnCount: number): number {
@@ -40,21 +44,28 @@ export function serialize(schema: Schema, row: Row): Buffer {
       continue;
     }
 
+    const v = coerceToColumnType(col.type, value, col.name);
     switch (col.type) {
       case "INT": {
-        if (typeof value !== "bigint") {
-          throw new TupleError(`column "${col.name}" expects INT (bigint), got ${typeof value}`);
-        }
         const buf = Buffer.alloc(U64);
-        buf.writeBigInt64LE(value); // throws if outside signed 64-bit range
+        buf.writeBigInt64LE(v as bigint); // throws if outside signed 64-bit range
+        parts.push(buf);
+        break;
+      }
+      case "REAL": {
+        const buf = Buffer.alloc(U64);
+        buf.writeDoubleLE(v as number);
+        parts.push(buf);
+        break;
+      }
+      case "DATETIME": {
+        const buf = Buffer.alloc(U64);
+        buf.writeBigInt64LE(BigInt((v as Date).getTime()));
         parts.push(buf);
         break;
       }
       case "TEXT": {
-        if (typeof value !== "string") {
-          throw new TupleError(`column "${col.name}" expects TEXT, got ${typeof value}`);
-        }
-        const utf8 = Buffer.from(value, "utf8");
+        const utf8 = Buffer.from(v as string, "utf8");
         if (utf8.length > 0xffff) {
           throw new TupleError(`TEXT value for "${col.name}" exceeds ${0xffff} bytes`);
         }
@@ -63,11 +74,18 @@ export function serialize(schema: Schema, row: Row): Buffer {
         parts.push(len, utf8);
         break;
       }
-      case "BOOL": {
-        if (typeof value !== "boolean") {
-          throw new TupleError(`column "${col.name}" expects BOOL, got ${typeof value}`);
+      case "BLOB": {
+        const bytes = v as Buffer;
+        if (bytes.length > 0xffff) {
+          throw new TupleError(`BLOB value for "${col.name}" exceeds ${0xffff} bytes`);
         }
-        parts.push(Buffer.from([value ? 1 : 0]));
+        const len = Buffer.alloc(U16);
+        len.writeUInt16LE(bytes.length);
+        parts.push(len, bytes);
+        break;
+      }
+      case "BOOL": {
+        parts.push(Buffer.from([(v as boolean) ? 1 : 0]));
         break;
       }
     }
@@ -101,12 +119,33 @@ export function deserialize(schema: Schema, buf: Buffer): Row {
         offset += U64;
         break;
       }
+      case "REAL": {
+        if (offset + U64 > buf.length) throw new TupleError(`truncated REAL for "${col.name}"`);
+        row[i] = buf.readDoubleLE(offset);
+        offset += U64;
+        break;
+      }
+      case "DATETIME": {
+        if (offset + U64 > buf.length) throw new TupleError(`truncated DATETIME for "${col.name}"`);
+        row[i] = new Date(Number(buf.readBigInt64LE(offset)));
+        offset += U64;
+        break;
+      }
       case "TEXT": {
         if (offset + U16 > buf.length) throw new TupleError(`truncated TEXT length for "${col.name}"`);
         const len = buf.readUInt16LE(offset);
         offset += U16;
         if (offset + len > buf.length) throw new TupleError(`truncated TEXT body for "${col.name}"`);
         row[i] = buf.toString("utf8", offset, offset + len);
+        offset += len;
+        break;
+      }
+      case "BLOB": {
+        if (offset + U16 > buf.length) throw new TupleError(`truncated BLOB length for "${col.name}"`);
+        const len = buf.readUInt16LE(offset);
+        offset += U16;
+        if (offset + len > buf.length) throw new TupleError(`truncated BLOB body for "${col.name}"`);
+        row[i] = Buffer.from(buf.subarray(offset, offset + len));
         offset += len;
         break;
       }

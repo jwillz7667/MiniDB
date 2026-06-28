@@ -38,7 +38,14 @@ export function parsePrepared(sql: string): ParsedStatement {
 }
 
 const COMPARE_OPS: ReadonlySet<string> = new Set(["=", "!=", "<", "<=", ">", ">="]);
-const COLUMN_TYPES: ReadonlySet<string> = new Set(["INT", "TEXT", "BOOL"]);
+const COLUMN_TYPES: ReadonlySet<string> = new Set([
+  "INT",
+  "REAL",
+  "TEXT",
+  "BOOL",
+  "BLOB",
+  "DATETIME",
+]);
 
 /** Parse exactly one statement (a trailing `;` is allowed). */
 export function parse(sql: string): Statement {
@@ -182,10 +189,10 @@ class Parser {
 
   private parseColumnDef(): ColumnDef {
     const name = this.expectIdentifier("a column name");
-    const typeTok = this.expect("keyword", undefined, "a column type (INT, TEXT, BOOL)");
+    const typeTok = this.expect("keyword", undefined, "a column type");
     if (!COLUMN_TYPES.has(typeTok.value)) {
       throw new ParseError(
-        `unknown column type "${typeTok.value}" (expected INT, TEXT, or BOOL)`,
+        `unknown column type "${typeTok.value}" (expected one of ${[...COLUMN_TYPES].join(", ")})`,
         typeTok.line,
         typeTok.column,
       );
@@ -371,17 +378,33 @@ class Parser {
 
   private parseLiteralValue(): LiteralValue {
     if (this.match("punctuation", "-")) {
-      const tok = this.expect("integer", undefined, "an integer after -");
-      return -BigInt(tok.value);
+      const tok = this.peek();
+      if (tok.type === "integer") {
+        this.advance();
+        return -BigInt(tok.value);
+      }
+      if (tok.type === "float") {
+        this.advance();
+        return -Number(tok.value);
+      }
+      throw this.error("an integer or float after -");
     }
     const t = this.peek();
     if (t.type === "integer") {
       this.advance();
       return BigInt(t.value);
     }
+    if (t.type === "float") {
+      this.advance();
+      return Number(t.value);
+    }
     if (t.type === "string") {
       this.advance();
       return t.value;
+    }
+    if (t.type === "blob") {
+      this.advance();
+      return Buffer.from(t.value, "hex");
     }
     if (t.type === "keyword") {
       switch (t.value) {
