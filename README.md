@@ -86,7 +86,7 @@ transparently.
 
 ```bash
 pnpm install
-pnpm test          # 116 tests, incl. a crash-injection fuzzer
+pnpm test          # 117 tests, incl. a power-loss crash fuzzer
 pnpm repl          # interactive SQL shell
 ```
 
@@ -229,11 +229,14 @@ docs/db-engine-spec.md    the original build spec
 
 Durability is the product, so it is tested as such. A **deterministic crash-injection fuzzer**
 (`tests/txn/crash-fuzz.test.ts`) runs randomized workloads — autocommit and explicit
-commit/rollback transactions over an indexed table — then "crashes" the database, recovers, and
-asserts the result exactly matches a reference oracle of committed state, with the secondary
-index agreeing with the heap for every value. A second test crashes mid-commit at an fsync and
-asserts the reopened database stays internally consistent. (Reverting the aborted-transaction
-recovery fix makes the fuzzer fail — it has teeth.)
+commit/rollback transactions over an indexed table — then simulates a **power loss** and
+recovers. The crash model is faithful: a `CrashSim` helper snapshots each file at every fsync
+and, on crash, reverts it to its last fsync'd image, so anything not durably synced actually
+disappears (a same-process reopen alone can't test this — it shares the OS cache). Recovery
+must then exactly match a reference oracle of committed state, with the secondary index
+agreeing with the heap for every value. The harness has teeth in both directions: reverting the
+aborted-transaction recovery fix makes it fail, and so does removing the commit fsync (a
+meta-test confirms that in `off` mode a crash loses committed data).
 
 > Honest caveat: on macOS, `fsync(2)` does not flush the drive's write cache — true power-loss
 > durability needs `fcntl(F_FULLFSYNC)`, which Node cannot issue without a native addon. The
@@ -246,7 +249,9 @@ B+Tree nodes are never merged or rebalanced, and rolled-back/dead versions leak 
 vacuum/compaction pass would reclaim all of it. Rows must fit within a single page (no overflow
 pages). Secondary indexes are on `INT` columns only. DDL inside an explicit transaction is
 rejected (it would desynchronize the in-memory catalog from an on-disk rollback). The engine is
-single-writer (enforced by the PID lock). There is no `JOIN` or `UPDATE` statement yet.
+single-writer, enforced by an advisory PID lock — which, like any PID-file lock, can't fully
+disambiguate a recycled PID (a kernel `flock` would); it fails closed, never corrupting. There
+is no `JOIN` or `UPDATE` statement yet.
 
 ## License
 
