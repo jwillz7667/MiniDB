@@ -1,0 +1,37 @@
+{
+  "name": "minidb",
+  "version": "1.0.0",
+  "description": "A real, durable SQL database engine from scratch in TypeScript: B+Tree storage, write-ahead log, ARIES-lite crash recovery, a Volcano executor, and MVCC snapshot isolation.",
+  "type": "module",
+  "license": "MIT",
+  "author": "jwillz7667",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jwillz7667/MiniDB.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "minidb": "./dist/repl.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "repl": "tsx src/repl.ts",
+    "bench": "tsx src/bench/bench.ts",
+    "demo:pool": "tsx scripts/demo-pool.ts",
+    "demo:crash": "tsx scripts/demo-crash.ts",
+    "demo:explain": "tsx scripts/demo-explain.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@vitest/coverage-v8": "^2.1.8",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
