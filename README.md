@@ -1,6 +1,8 @@
 # minidb
 
 [![CI](https://github.com/jwillz7667/MiniDB/actions/workflows/ci.yml/badge.svg)](https://github.com/jwillz7667/MiniDB/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](https://github.com/jwillz7667/MiniDB/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 A **real, durable SQL database engine written from scratch in TypeScript** — a B+Tree
 storage engine, a write-ahead log, ARIES-lite crash recovery, a Volcano query executor, and
@@ -78,7 +80,7 @@ transparently.
 
 ```bash
 pnpm install
-pnpm test          # 90 tests across all 8 phases
+pnpm test          # 101 tests across all 8 phases
 pnpm repl          # interactive SQL shell
 ```
 
