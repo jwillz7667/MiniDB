@@ -1,5 +1,5 @@
 import { I64, INVALID_PAGE, U32, U8 } from "../constants.js";
-import { ExecutionError } from "../errors.js";
+import { ConstraintError, ExecutionError } from "../errors.js";
 import type { Catalog, TableMeta } from "../record/catalog.js";
 import { columnIndex, type Value } from "../record/schema.js";
 import { deserialize, serialize } from "../record/tuple.js";
@@ -62,10 +62,23 @@ export class TableStore {
     return stub;
   }
 
+  /** Throw if a non-null value collides with an existing entry in a unique index. */
+  private assertUnique(tx: Tx, table: TableMeta, key: Value, index: { columnName: string; root: number }): void {
+    if (key === null) return; // SQL treats NULLs as distinct in a UNIQUE column
+    if (BTree.searchOne(tx, index.root, key as bigint) !== null) {
+      throw new ConstraintError(
+        `UNIQUE constraint failed: ${table.name}.${index.columnName} = ${String(key)}`,
+      );
+    }
+  }
+
   /** Insert a row, maintaining the primary index and every secondary index. */
   insertRow(tx: Tx, table: TableMeta, rowid: bigint, values: Value[]): Rid {
     if (!this.hasRowId(table)) {
       throw new ExecutionError(`system table "${table.name}" is read-only`);
+    }
+    for (const index of this.catalog.getIndexes(table.name)) {
+      if (index.unique) this.assertUnique(tx, table, values[columnIndex(table.schema, index.columnName)]!, index);
     }
     const rid = this.heap.insert(tx, table.heapRoot, this.encodeRecord(tx, table, rowid, values));
     BTree.insert(tx, table.pkRoot, rowid, rid);
@@ -87,8 +100,15 @@ export class TableStore {
     if (!this.hasRowId(table)) {
       throw new ExecutionError(`system table "${table.name}" is read-only`);
     }
-    const record = this.encodeRecord(tx, table, row.rowid, newValues);
     const indexes = this.catalog.getIndexes(table.name);
+    for (const index of indexes) {
+      if (!index.unique) continue;
+      const col = columnIndex(table.schema, index.columnName);
+      const newKey = newValues[col]!;
+      if (newKey !== null && newKey !== row.values[col]) this.assertUnique(tx, table, newKey, index);
+    }
+
+    const record = this.encodeRecord(tx, table, row.rowid, newValues);
     const current = this.heap.get(tx, row.rid);
 
     if (current.length === record.length) {

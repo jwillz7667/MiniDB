@@ -72,8 +72,10 @@ export interface LogicalLimit {
 export interface LogicalInsert {
   readonly kind: "insert";
   readonly table: TableMeta;
-  /** Rows already aligned to the table's full column order, NULLs for defaults. */
+  /** Rows aligned to the table's full column order, with DEFAULTs already applied. */
   readonly rows: Value[][];
+  /** When set, an AUTOINCREMENT column is filled from its index at execution. */
+  readonly autoIncrement?: { columnIndex: number; indexRoot: number };
 }
 
 /** A single resolved assignment: column position + value expression. */
@@ -153,11 +155,11 @@ export function buildInsert(stmt: InsertStmt, catalog: Catalog): LogicalInsert {
   const targetIndices = targetNames.map((name) => columnIndex(table.schema, name));
   const provided = new Set(targetIndices);
 
-  // Every column omitted from the INSERT must accept NULL.
+  // A column omitted from the INSERT must have a DEFAULT, be AUTOINCREMENT, or
+  // accept NULL — otherwise there is no value to write.
   table.columns.forEach((col, i) => {
-    if (!provided.has(i) && !col.nullable) {
-      throw new PlanError(`column "${col.name}" has no default and was not provided`);
-    }
+    if (provided.has(i) || col.default !== undefined || col.autoIncrement || col.nullable) return;
+    throw new PlanError(`column "${col.name}" has no default and was not provided`);
   });
 
   const rows = stmt.rows.map((items) => {
@@ -166,7 +168,9 @@ export function buildInsert(stmt: InsertStmt, catalog: Catalog): LogicalInsert {
         `INSERT has ${items.length} values for ${targetNames.length} columns`,
       );
     }
-    const full: Value[] = table.columns.map(() => null);
+    // Start each row from its column DEFAULTs (NULL when none), then overlay the
+    // provided values. AUTOINCREMENT columns stay NULL here and are filled later.
+    const full: Value[] = table.columns.map((col) => (col.default !== undefined ? col.default : null));
     items.forEach((item, j) => {
       const value = literalOf(item);
       const schemaIdx = targetIndices[j]!;
@@ -176,7 +180,12 @@ export function buildInsert(stmt: InsertStmt, catalog: Catalog): LogicalInsert {
     return full;
   });
 
-  return { kind: "insert", table, rows };
+  const autoCol = table.columns.findIndex((c) => c.autoIncrement);
+  if (autoCol < 0) return { kind: "insert", table, rows };
+
+  const index = catalog.findIndex(table.name, table.columns[autoCol]!.name);
+  if (!index) throw new PlanError(`AUTOINCREMENT column "${table.columns[autoCol]!.name}" has no index`);
+  return { kind: "insert", table, rows, autoIncrement: { columnIndex: autoCol, indexRoot: index.root } };
 }
 
 export function buildDelete(stmt: DeleteStmt, catalog: Catalog): LogicalDelete {

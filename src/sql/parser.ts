@@ -62,6 +62,11 @@ export function parseMany(sql: string): Statement[] {
   return new Parser(tokenize(sql)).parseProgram();
 }
 
+/** Parse a single literal value (used to round-trip a stored column DEFAULT). */
+export function parseLiteral(text: string): LiteralValue {
+  return new Parser(tokenize(text)).readLiteralAtEnd();
+}
+
 class Parser {
   private pos = 0;
   private params = 0;
@@ -71,6 +76,13 @@ class Parser {
   /** Number of `?` placeholders seen so far (final value after parsing). */
   get paramCount(): number {
     return this.params;
+  }
+
+  /** Read exactly one literal value and require the input to be fully consumed. */
+  readLiteralAtEnd(): LiteralValue {
+    const value = this.parseLiteralValue();
+    if (!this.atEnd()) throw this.error("trailing tokens after literal");
+    return value;
   }
 
   parseProgram(): Statement[] {
@@ -197,12 +209,33 @@ class Parser {
         typeTok.column,
       );
     }
+    const type = typeTok.value as ColumnType;
+
     let nullable = true;
-    if (this.matchKeyword("NOT")) {
-      this.expectKeyword("NULL");
-      nullable = false;
+    let primaryKey = false;
+    let unique = false;
+    let autoIncrement = false;
+    let dflt: LiteralValue | undefined;
+
+    for (;;) {
+      if (this.matchKeyword("NOT")) {
+        this.expectKeyword("NULL");
+        nullable = false;
+      } else if (this.matchKeyword("PRIMARY")) {
+        this.expectKeyword("KEY");
+        primaryKey = true;
+        nullable = false; // PRIMARY KEY implies NOT NULL
+      } else if (this.matchKeyword("UNIQUE")) {
+        unique = true;
+      } else if (this.matchKeyword("AUTOINCREMENT")) {
+        autoIncrement = true;
+      } else if (this.matchKeyword("DEFAULT")) {
+        dflt = this.parseLiteralValue();
+      } else {
+        break;
+      }
     }
-    return { name, type: typeTok.value as ColumnType, nullable };
+    return { name, type, nullable, primaryKey, unique, autoIncrement, default: dflt };
   }
 
   private parseCreateIndexBody(): Statement {

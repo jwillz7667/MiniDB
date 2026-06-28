@@ -6,6 +6,7 @@ import type { Pager } from "../storage/pager.js";
 import type { Tx } from "../storage/tx.js";
 import {
   type Column,
+  type ColumnType,
   type Schema,
   type Value,
   makeSchema,
@@ -13,6 +14,7 @@ import {
   typeTag,
 } from "./schema.js";
 import { deserialize, serialize } from "./tuple.js";
+import { coerceToColumnType } from "./value.js";
 
 /** Resolved metadata for one table held in memory for fast planning. */
 export interface TableMeta {
@@ -29,7 +31,14 @@ export interface IndexMeta {
   readonly tableName: string;
   readonly columnName: string;
   readonly root: number;
+  /** Enforced as UNIQUE (created for PRIMARY KEY / UNIQUE columns). */
+  readonly unique: boolean;
 }
+
+/** Persisted column-constraint flags (bitfield in minidb_columns.flags). */
+const FLAG_PK = 1;
+const FLAG_UNIQUE = 2;
+const FLAG_AUTOINC = 4;
 
 const TABLES = "minidb_tables";
 const COLUMNS = "minidb_columns";
@@ -47,12 +56,20 @@ const COLUMNS_SCHEMA = makeSchema([
   { name: "type_tag", type: "INT", nullable: false },
   { name: "ordinal", type: "INT", nullable: false },
   { name: "nullable", type: "BOOL", nullable: false },
+  { name: "flags", type: "INT", nullable: false },
+  { name: "dflt", type: "BLOB", nullable: true }, // serialized DEFAULT value, or NULL
 ]);
 const INDEXES_SCHEMA = makeSchema([
   { name: "table_name", type: "TEXT", nullable: false },
   { name: "col_name", type: "TEXT", nullable: false },
   { name: "root", type: "INT", nullable: false },
+  { name: "is_unique", type: "BOOL", nullable: false },
 ]);
+
+/** Single-column schema used to (de)serialize a column's DEFAULT value. */
+function defaultSchema(type: ColumnType): Schema {
+  return makeSchema([{ name: "d", type, nullable: true }]);
+}
 
 const SYSTEM_SCHEMAS: Record<string, Schema> = {
   [TABLES]: TABLES_SCHEMA,
@@ -62,6 +79,50 @@ const SYSTEM_SCHEMAS: Record<string, Schema> = {
 
 function isSystemTable(name: string): boolean {
   return name === TABLES || name === COLUMNS || name === INDEXES;
+}
+
+function flagsOf(col: Column): number {
+  return (
+    (col.primaryKey ? FLAG_PK : 0) |
+    (col.unique ? FLAG_UNIQUE : 0) |
+    (col.autoIncrement ? FLAG_AUTOINC : 0)
+  );
+}
+
+/** Reject unsupported constraint combinations before any catalog write. */
+function validateConstraints(name: string, columns: Column[]): void {
+  let pkCount = 0;
+  for (const col of columns) {
+    if (col.primaryKey) pkCount += 1;
+    if ((col.primaryKey || col.unique) && col.type !== "INT") {
+      throw new CatalogError(
+        `${col.primaryKey ? "PRIMARY KEY" : "UNIQUE"} column "${col.name}" must be INT ` +
+          `(string-keyed indexes are not supported yet)`,
+      );
+    }
+    if (col.autoIncrement) {
+      if (col.type !== "INT") throw new CatalogError(`AUTOINCREMENT column "${col.name}" must be INT`);
+      if (!col.primaryKey) {
+        throw new CatalogError(`AUTOINCREMENT column "${col.name}" must be PRIMARY KEY`);
+      }
+    }
+    if (col.default !== undefined) {
+      if (col.default === null) {
+        if (!col.nullable) throw new CatalogError(`DEFAULT NULL on NOT NULL column "${col.name}"`);
+      } else {
+        try {
+          coerceToColumnType(col.type, col.default, col.name); // validate type at DDL time
+        } catch (err) {
+          throw new CatalogError(err instanceof Error ? err.message : String(err));
+        }
+      }
+    }
+  }
+  if (pkCount > 1) {
+    throw new CatalogError(
+      `table "${name}" declares ${pkCount} PRIMARY KEY columns; only a single-column key is supported`,
+    );
+  }
 }
 
 /**
@@ -126,16 +187,23 @@ export class Catalog {
     // Pass 2: group user columns by table.
     const columnsByTable = new Map<string, { ordinal: number; column: Column }[]>();
     for (const rec of heap.scan(tx, columnsRoot)) {
-      const [tableName, colName, tag, ordinal, nullable] = deserialize(COLUMNS_SCHEMA, rec.bytes);
+      const [tableName, colName, tag, ordinal, nullable, flags, dflt] = deserialize(
+        COLUMNS_SCHEMA,
+        rec.bytes,
+      );
+      const type = typeFromTag(Number(tag as bigint));
+      const f = Number(flags as bigint);
+      const column: Column = {
+        name: colName as string,
+        type,
+        nullable: nullable as boolean,
+        primaryKey: (f & FLAG_PK) !== 0,
+        unique: (f & FLAG_UNIQUE) !== 0,
+        autoIncrement: (f & FLAG_AUTOINC) !== 0,
+        ...(dflt !== null ? { default: deserialize(defaultSchema(type), dflt as Buffer)[0]! } : {}),
+      };
       const list = columnsByTable.get(tableName as string) ?? [];
-      list.push({
-        ordinal: Number(ordinal as bigint),
-        column: {
-          name: colName as string,
-          type: typeFromTag(Number(tag as bigint)),
-          nullable: nullable as boolean,
-        },
-      });
+      list.push({ ordinal: Number(ordinal as bigint), column });
       columnsByTable.set(tableName as string, list);
     }
 
@@ -160,11 +228,12 @@ export class Catalog {
 
     // Pass 4: secondary indexes.
     for (const rec of heap.scan(tx, indexesRoot)) {
-      const [tableName, colName, root] = deserialize(INDEXES_SCHEMA, rec.bytes);
+      const [tableName, colName, root, isUnique] = deserialize(INDEXES_SCHEMA, rec.bytes);
       cat.indexes.push({
         tableName: tableName as string,
         columnName: colName as string,
         root: Number(root as bigint),
+        unique: isUnique as boolean,
       });
     }
 
@@ -201,9 +270,10 @@ export class Catalog {
       throw new CatalogError(`table "${name}" already exists`);
     }
     if (columns.length === 0) throw new CatalogError(`table "${name}" needs at least one column`);
-    // Validate the column list (duplicate names, etc.) BEFORE writing anything,
-    // so a bad definition never leaves half-written catalog rows behind.
+    // Validate the column list and constraints BEFORE writing anything, so a bad
+    // definition never leaves half-written catalog rows behind.
     const schema = makeSchema(columns);
+    validateConstraints(name, columns);
 
     const heapRoot = this.heap.create(tx);
     const pkRoot = BTree.create(tx);
@@ -215,16 +285,29 @@ export class Catalog {
         BigInt(typeTag(col.type)),
         BigInt(ordinal),
         col.nullable,
+        BigInt(flagsOf(col)),
+        col.default !== undefined ? serialize(defaultSchema(col.type), [col.default]) : null,
       ];
       this.heap.insert(tx, this.columnsRoot, serialize(COLUMNS_SCHEMA, row));
     });
 
     const meta: TableMeta = { name, heapRoot, pkRoot, columns, schema };
     this.tables.set(name.toLowerCase(), meta);
+
+    // A PRIMARY KEY / UNIQUE column gets a unique B+Tree index (used for both
+    // constraint enforcement and index scans). The table starts empty, so the
+    // index does too.
+    for (const col of columns) {
+      if (col.primaryKey || col.unique) {
+        const root = BTree.create(tx);
+        this.writeIndexRow(tx, name, col.name, root, true);
+        this.indexes.push({ tableName: name, columnName: col.name, root, unique: true });
+      }
+    }
     return meta;
   }
 
-  /** Record a secondary index (its B+Tree must already be built/populated). */
+  /** Record a secondary (non-unique) index; its B+Tree must already be populated. */
   createIndex(tx: Tx, tableName: string, columnName: string, root: number): IndexMeta {
     const table = this.requireTable(tableName);
     if (!table.columns.some((c) => c.name.toLowerCase() === columnName.toLowerCase())) {
@@ -233,11 +316,21 @@ export class Catalog {
     if (this.findIndex(tableName, columnName)) {
       throw new CatalogError(`an index on ${tableName}(${columnName}) already exists`);
     }
-    const row: Value[] = [table.name, columnName, BigInt(root)];
-    this.heap.insert(tx, this.indexesRoot, serialize(INDEXES_SCHEMA, row));
-    const meta: IndexMeta = { tableName: table.name, columnName, root };
+    this.writeIndexRow(tx, table.name, columnName, root, false);
+    const meta: IndexMeta = { tableName: table.name, columnName, root, unique: false };
     this.indexes.push(meta);
     return meta;
+  }
+
+  private writeIndexRow(
+    tx: Tx,
+    tableName: string,
+    columnName: string,
+    root: number,
+    unique: boolean,
+  ): void {
+    const row: Value[] = [tableName, columnName, BigInt(root), unique];
+    this.heap.insert(tx, this.indexesRoot, serialize(INDEXES_SCHEMA, row));
   }
 
   getTable(name: string): TableMeta | undefined {
