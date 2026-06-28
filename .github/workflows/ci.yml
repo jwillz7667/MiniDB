@@ -21,7 +21,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ["20", "22"]
+        # pnpm 11 requires Node >= 22.13, and GitHub is deprecating Node 20
+        # runners; the engine itself only uses stable APIs (package.json keeps
+        # engines >= 20).
+        node: ["22", "24"]
     steps:
       - uses: actions/checkout@v4
 
