@@ -1,6 +1,6 @@
 import { INVALID_PAGE } from "./constants.js";
 import { TransactionError } from "./errors.js";
-import { RowIdAllocator, type ExecContext } from "./exec/context.js";
+import { DEFAULT_MAX_SORT_ROWS, RowIdAllocator, type ExecContext } from "./exec/context.js";
 import { Executor, type QueryResult } from "./exec/executor.js";
 import { TableStore } from "./exec/table-store.js";
 import { Catalog, type TableMeta } from "./record/catalog.js";
@@ -21,6 +21,8 @@ export interface DatabaseOptions {
   readonly poolSize?: number;
   /** Durability policy: "full" (default, safest), "normal", or "off". */
   readonly synchronous?: SyncMode;
+  /** Max rows an unbounded (no-LIMIT) ORDER BY may buffer before failing safe. */
+  readonly maxSortRows?: number;
 }
 
 /** Result of a control statement plus everything the executor can return. */
@@ -52,6 +54,7 @@ export class Database {
     private readonly rowids: RowIdAllocator,
     private readonly readTx: DirectTx,
     private readonly lock: FileLock,
+    private readonly maxSortRows: number,
     recovery: RecoveryStats,
   ) {
     this.lastRecovery = recovery;
@@ -111,6 +114,7 @@ export class Database {
       rowids,
       new DirectTx(pool),
       lock,
+      options.maxSortRows ?? DEFAULT_MAX_SORT_ROWS,
       recovery,
     );
   }
@@ -138,6 +142,7 @@ export class Database {
         catalog: this.catalog,
         store: this.store,
         rowids: this.rowids,
+        maxSortRows: this.maxSortRows,
       };
       return new Executor(ctx, this.catalog).run(stmt);
     }
@@ -178,6 +183,7 @@ export class Database {
       catalog: this.catalog,
       store: this.store,
       rowids: this.rowids,
+      maxSortRows: this.maxSortRows,
     };
     return new Executor(ctx, this.catalog).run(stmt);
   }

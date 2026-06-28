@@ -53,6 +53,8 @@ export interface PhysSort {
   readonly columns: Column[];
   readonly sortIndex: number;
   readonly dir: SortDir;
+  /** When an enclosing LIMIT is known, the sort keeps only this many rows (top-N). */
+  readonly limit: number | undefined;
   readonly input: PhysicalPlan;
 }
 export interface PhysLimit {
@@ -74,7 +76,12 @@ export interface PhysDelete {
   readonly input: PhysicalPlan;
 }
 
-export function toPhysical(plan: LogicalPlan): PhysicalPlan {
+/**
+ * Bind the logical plan to operators. `limitHint` carries a row cap downward
+ * from a LIMIT through row-count-preserving Project nodes into a Sort, so
+ * `ORDER BY … LIMIT n` keeps only the top n rows instead of buffering everything.
+ */
+export function toPhysical(plan: LogicalPlan, limitHint?: number): PhysicalPlan {
   switch (plan.kind) {
     case "scan":
       return { op: "SeqScan", table: plan.table, columns: plan.table.columns };
@@ -93,7 +100,7 @@ export function toPhysical(plan: LogicalPlan): PhysicalPlan {
       return { op: "Filter", predicate: plan.predicate, columns: input.columns, input };
     }
     case "project": {
-      const input = toPhysical(plan.input);
+      const input = toPhysical(plan.input, limitHint); // Project preserves row count
       const indices = plan.columns.map((name) => columnIndex({ columns: input.columns }, name));
       const columns = indices.map((i) => input.columns[i]!);
       return { op: "Project", columns, indices, input };
@@ -101,10 +108,10 @@ export function toPhysical(plan: LogicalPlan): PhysicalPlan {
     case "sort": {
       const input = toPhysical(plan.input);
       const sortIndex = columnIndex({ columns: input.columns }, plan.column);
-      return { op: "Sort", columns: input.columns, sortIndex, dir: plan.dir, input };
+      return { op: "Sort", columns: input.columns, sortIndex, dir: plan.dir, limit: limitHint, input };
     }
     case "limit": {
-      const input = toPhysical(plan.input);
+      const input = toPhysical(plan.input, plan.limit);
       return { op: "Limit", columns: input.columns, limit: plan.limit, input };
     }
     case "insert":
@@ -146,7 +153,10 @@ function nodeLabel(plan: PhysicalPlan): string {
     case "Project":
       return `Project (${plan.columns.map((c) => c.name).join(", ")})`;
     case "Sort":
-      return `Sort ${plan.columns[plan.sortIndex]!.name} ${plan.dir}`;
+      return (
+        `Sort ${plan.columns[plan.sortIndex]!.name} ${plan.dir}` +
+        (plan.limit !== undefined ? ` (top ${plan.limit})` : "")
+      );
     case "Limit":
       return `Limit ${plan.limit}`;
     case "Insert":

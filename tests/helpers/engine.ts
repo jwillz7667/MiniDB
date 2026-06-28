@@ -1,4 +1,8 @@
-import { RowIdAllocator, type ExecContext } from "../../src/exec/context.js";
+import {
+  DEFAULT_MAX_SORT_ROWS,
+  RowIdAllocator,
+  type ExecContext,
+} from "../../src/exec/context.js";
 import { Executor, type QueryResult } from "../../src/exec/executor.js";
 import { TableStore } from "../../src/exec/table-store.js";
 import { Catalog } from "../../src/record/catalog.js";
@@ -39,6 +43,7 @@ export function makeEngine(tmp: TempDb = makeTempDb(), poolSize = 64): TestEngin
     catalog,
     store: new TableStore(catalog, heap),
     rowids: new RowIdAllocator(),
+    maxSortRows: DEFAULT_MAX_SORT_ROWS,
   };
   const executor = new Executor(ctx, catalog);
 
