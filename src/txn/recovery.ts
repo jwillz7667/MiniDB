@@ -46,6 +46,7 @@ export function recover(pager: Pager, wal: Wal): RecoveryStats {
   if (records.length === 0) return EMPTY;
 
   const committed = new Set<bigint>();
+  const aborted = new Set<bigint>();
   let lastCheckpointIdx = -1;
   let maxLsn = 0n;
   let maxTxid = 0n;
@@ -53,6 +54,7 @@ export function recover(pager: Pager, wal: Wal): RecoveryStats {
     if (r.lsn > maxLsn) maxLsn = r.lsn;
     if (r.type !== "checkpoint" && r.txid > maxTxid) maxTxid = r.txid;
     if (r.type === "commit") committed.add(r.txid);
+    if (r.type === "abort") aborted.add(r.txid);
     if (r.type === "checkpoint") lastCheckpointIdx = i;
   });
   const redoStartLsn = lastCheckpointIdx >= 0 ? records[lastCheckpointIdx]!.lsn : 0n;
@@ -78,10 +80,14 @@ export function recover(pager: Pager, wal: Wal): RecoveryStats {
     }
   }
 
+  // Undo ONLY true in-flight losers: transactions with neither a COMMIT nor an
+  // ABORT record. An aborted transaction already reverted itself via logged CLRs
+  // that redo replayed above, so undoing its before-images here would wrongly
+  // clobber whatever a later committed transaction wrote to the same bytes.
   let undone = 0;
   for (let i = records.length - 1; i >= 0; i--) {
     const r = records[i]!;
-    if (r.type === "update" && !committed.has(r.txid)) {
+    if (r.type === "update" && !committed.has(r.txid) && !aborted.has(r.txid)) {
       r.before.copy(pageOf(r.pageNo), r.offset);
       undone += 1;
     }

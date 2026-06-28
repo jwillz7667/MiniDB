@@ -48,11 +48,15 @@ function diffRuns(before: Buffer, after: Buffer, mergeGap = 16): Run[] {
  * (heap, B+Tree) stay logging-agnostic: they just call `modify`, which snapshots
  * the page, runs the mutator, and logs the minimal changed byte span as an
  * UPDATE record before marking the page dirty. The before-images are also kept
- * in memory so the transaction can roll itself back.
+ * in memory so the transaction can roll itself back (logging compensation
+ * records as it does — see `applyUndo`).
  *
- * Single-writer model: at most one WalTx mutates at a time, so the only "loser"
- * after a crash is the final in-flight transaction — which is what makes the
- * recovery's physical undo correct (no committed write can follow a loser's).
+ * Single-writer model: at most one WalTx mutates at a time, so the only true
+ * in-flight "loser" after a crash is the final transaction that had neither
+ * committed nor aborted. Recovery undoes exactly those (an aborted transaction
+ * is reverted by its own logged CLRs, not by the undo pass), which is what keeps
+ * the physical redo/undo correct even when a committed write follows an aborted
+ * one on the same bytes.
  */
 export class WalTx implements Tx {
   private readonly undoLog: UndoEntry[] = [];
@@ -106,13 +110,35 @@ export class WalTx implements Tx {
     }
   }
 
-  /** Roll back this transaction's in-memory effects by replaying before-images. */
+  /**
+   * Roll the transaction back by replaying its before-images in reverse — and,
+   * crucially, LOG each restoration as a compensation record (CLR). Without
+   * CLRs the rollback would be invisible to the log: recovery's redo would
+   * re-apply this transaction's after-images and nothing would revert them,
+   * while its before-images would still sit in the log, eligible to clobber a
+   * value a *later committed* transaction wrote to the same bytes. With CLRs,
+   * redo reconstructs the rolled-back state and recovery never undoes an aborted
+   * transaction (only true in-flight losers are undone).
+   */
   applyUndo(): void {
     for (let i = this.undoLog.length - 1; i >= 0; i--) {
       const u = this.undoLog[i]!;
       const page = this.pool.fetchPage(u.pageNo);
-      u.before.copy(page, u.offset);
-      this.pool.unpin(u.pageNo, true);
+      try {
+        const current = Buffer.from(page.subarray(u.offset, u.offset + u.before.length));
+        const lsn = this.wal.append({
+          type: "update",
+          txid: this.txid,
+          pageNo: u.pageNo,
+          offset: u.offset,
+          before: current,
+          after: u.before,
+        });
+        this.pool.setPageLSN(u.pageNo, lsn);
+        u.before.copy(page, u.offset);
+      } finally {
+        this.pool.unpin(u.pageNo, true);
+      }
     }
   }
 

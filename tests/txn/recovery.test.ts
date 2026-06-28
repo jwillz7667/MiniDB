@@ -84,6 +84,39 @@ describe("crash recovery", () => {
     db2.close();
   });
 
+  it("does not let an aborted transaction clobber a later committed write (crash)", () => {
+    const db1 = open();
+    db1.exec("CREATE TABLE t (id INT NOT NULL, n INT NOT NULL)");
+    db1.checkpoint();
+
+    db1.exec("BEGIN");
+    db1.exec("INSERT INTO t (id, n) VALUES (1, 10)");
+    db1.exec("ROLLBACK"); // aborted T1 — its UPDATE records are durable in the WAL
+
+    // A committed transaction now rewrites the same heap-header bytes T1 touched.
+    db1.exec("INSERT INTO t (id, n) VALUES (2, 20)");
+    // crash.
+
+    const db2 = open();
+    // The committed row must survive; recovery must NOT undo the aborted T1.
+    expect(ids(db2, "SELECT id FROM t ORDER BY id")).toEqual([2n]);
+    db2.close();
+  });
+
+  it("does not let an aborted transaction clobber a committed write (clean reopen)", () => {
+    const db1 = open();
+    db1.exec("CREATE TABLE t (id INT NOT NULL, n INT NOT NULL)");
+    db1.exec("BEGIN");
+    db1.exec("INSERT INTO t (id, n) VALUES (1, 10)");
+    db1.exec("ROLLBACK");
+    db1.exec("INSERT INTO t (id, n) VALUES (2, 20)");
+    db1.close(); // clean shutdown (checkpoint keeps the whole WAL, including the abort)
+
+    const db2 = open();
+    expect(ids(db2, "SELECT id FROM t ORDER BY id")).toEqual([2n]);
+    db2.close();
+  });
+
   it("recovers an index so post-crash index scans stay correct", () => {
     const db1 = open();
     db1.exec("CREATE TABLE t (id INT NOT NULL, age INT NOT NULL)");
