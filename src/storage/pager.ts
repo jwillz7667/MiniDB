@@ -2,7 +2,6 @@ import {
   closeSync,
   existsSync,
   fstatSync,
-  fsyncSync,
   ftruncateSync,
   openSync,
   readSync,
@@ -26,6 +25,7 @@ import {
 } from "../constants.js";
 import { CorruptDatabaseError, PageError } from "../errors.js";
 import { crc32 } from "./crc32.js";
+import { Durability } from "./durability.js";
 
 /**
  * The lowest layer: turns one file into a sequence of fixed-size pages. Page 0
@@ -44,10 +44,11 @@ export class Pager {
     readonly path: string,
     private readonly header: Buffer,
     private count: number,
+    private readonly durability: Durability,
   ) {}
 
   /** Open an existing database file or create a fresh one. */
-  static open(path: string): Pager {
+  static open(path: string, durability: Durability = new Durability()): Pager {
     const existed = existsSync(path);
     const fd = openSync(path, existed ? "r+" : "w+");
 
@@ -62,8 +63,9 @@ export class Pager {
       header.writeBigUInt64LE(1n, HEADER_NEXT_TXID_OFFSET); // txids start at 1
       stampChecksum(header);
       writeSync(fd, header, 0, PAGE_SIZE, 0);
-      fsyncSync(fd);
-      return new Pager(fd, path, header, 1);
+      durability.barrier(fd);
+      durability.syncDir(path); // make the new file's directory entry durable
+      return new Pager(fd, path, header, 1, durability);
     }
 
     const header = Buffer.alloc(PAGE_SIZE);
@@ -102,7 +104,7 @@ export class Pager {
       ftruncateSync(fd, count * PAGE_SIZE);
     }
     header.writeUInt32LE(count, HEADER_PAGE_COUNT_OFFSET);
-    return new Pager(fd, path, header, count);
+    return new Pager(fd, path, header, count, durability);
   }
 
   /** Number of pages currently in the file (including the header page 0). */
@@ -168,7 +170,7 @@ export class Pager {
     if (written !== PAGE_SIZE) {
       throw new PageError(`short write on page ${pageNo}: ${written}/${PAGE_SIZE} bytes`);
     }
-    if (sync) fsyncSync(this.fd);
+    if (sync) this.durability.barrier(this.fd);
   }
 
   /** Grow the file by one zero-filled page and return its page number. */
@@ -197,7 +199,7 @@ export class Pager {
   private writeHeader(): void {
     stampChecksum(this.header);
     writeSync(this.fd, this.header, 0, PAGE_SIZE, 0);
-    fsyncSync(this.fd);
+    this.durability.barrier(this.fd);
   }
 
   /** Heap root page of the catalog (minidb_tables), or INVALID_PAGE if unset. */
@@ -225,7 +227,7 @@ export class Pager {
     // Keep the persisted page count current before forcing the file down.
     stampChecksum(this.header);
     writeSync(this.fd, this.header, 0, PAGE_SIZE, 0);
-    fsyncSync(this.fd);
+    this.durability.barrier(this.fd);
   }
 
   close(): void {

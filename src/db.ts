@@ -5,6 +5,7 @@ import { Executor, type QueryResult } from "./exec/executor.js";
 import { TableStore } from "./exec/table-store.js";
 import { Catalog, type TableMeta } from "./record/catalog.js";
 import { BufferPool } from "./storage/bufferpool.js";
+import { Durability, type SyncMode } from "./storage/durability.js";
 import { Heap } from "./storage/heap.js";
 import { Pager } from "./storage/pager.js";
 import { DirectTx } from "./storage/tx.js";
@@ -17,6 +18,8 @@ import { Wal } from "./txn/wal.js";
 export interface DatabaseOptions {
   /** Number of frames in the buffer pool. */
   readonly poolSize?: number;
+  /** Durability policy: "full" (default, safest), "normal", or "off". */
+  readonly synchronous?: SyncMode;
 }
 
 /** Result of a control statement plus everything the executor can return. */
@@ -55,8 +58,9 @@ export class Database {
   }
 
   static open(path: string, options: DatabaseOptions = {}): Database {
-    const pager = Pager.open(path);
-    const wal = Wal.open(`${path}-wal`);
+    const durability = new Durability(options.synchronous ?? "full");
+    const pager = Pager.open(path, durability);
+    const wal = Wal.open(`${path}-wal`, durability);
 
     // Replay the WAL into the data file before anything caches a page.
     const recovery = recover(pager, wal);
@@ -66,7 +70,7 @@ export class Database {
     }
 
     const pool = new BufferPool(pager, options.poolSize ?? 256);
-    pool.setBeforeFlush((pageLSN) => wal.flush(pageLSN)); // write-ahead rule
+    pool.setBeforeFlush(() => wal.flush()); // write-ahead rule
 
     const heap = new Heap();
     const fresh = pager.getCatalogRoot() === INVALID_PAGE;
@@ -163,16 +167,16 @@ export class Database {
   }
 
   private commit(tx: WalTx): void {
-    const lsn = this.wal.append({ type: "commit", txid: tx.txid });
-    this.wal.flush(lsn); // commit is durable only once its record is fsync'd
+    this.wal.append({ type: "commit", txid: tx.txid });
+    this.wal.flushForCommit(); // commit is durable once its record is flushed
     this.active.delete(tx.txid);
     tx.markFinished();
   }
 
   private rollback(tx: WalTx): void {
     tx.applyUndo();
-    const lsn = this.wal.append({ type: "abort", txid: tx.txid });
-    this.wal.flush(lsn);
+    this.wal.append({ type: "abort", txid: tx.txid });
+    this.wal.flushForCommit();
     this.active.delete(tx.txid);
     tx.markFinished();
     // The undo may have shrunk heap chains and rewound rowid/btree state, so
@@ -187,8 +191,8 @@ export class Database {
    */
   checkpoint(): void {
     this.pool.flushAll(); // honors the write-ahead rule via the flush hook
-    const lsn = this.wal.append({ type: "checkpoint", active: [...this.active] });
-    this.wal.flush(lsn);
+    this.wal.append({ type: "checkpoint", active: [...this.active] });
+    this.wal.flush(); // a checkpoint must be durable, so a hard barrier
     this.pager.setNextTxid(this.nextTxid);
   }
 
