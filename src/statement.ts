@@ -89,6 +89,7 @@ export class PreparedStatement {
     switch (result.type) {
       case "insert":
         return { changes: result.rowCount, lastInsertRowid: result.lastInsertRowid };
+      case "update":
       case "delete":
         return { changes: result.rowCount, lastInsertRowid: null };
       default:

@@ -8,6 +8,7 @@ import type {
   InsertStmt,
   SelectStmt,
   SortDir,
+  UpdateStmt,
   ValueExpr,
 } from "../sql/ast.js";
 
@@ -24,6 +25,7 @@ export type LogicalPlan =
   | LogicalSort
   | LogicalLimit
   | LogicalInsert
+  | LogicalUpdate
   | LogicalDelete;
 
 export interface LogicalScan {
@@ -71,6 +73,19 @@ export interface LogicalInsert {
   readonly table: TableMeta;
   /** Rows already aligned to the table's full column order, NULLs for defaults. */
   readonly rows: Value[][];
+}
+
+/** A single resolved assignment: column position + value expression. */
+export interface ResolvedAssignment {
+  readonly index: number;
+  readonly value: Expr;
+}
+
+export interface LogicalUpdate {
+  readonly kind: "update";
+  readonly table: TableMeta;
+  readonly assignments: ResolvedAssignment[];
+  readonly input: LogicalPlan;
 }
 
 export interface LogicalDelete {
@@ -173,6 +188,28 @@ export function buildDelete(stmt: DeleteStmt, catalog: Catalog): LogicalDelete {
     input = { kind: "filter", predicate: stmt.where, input };
   }
   return { kind: "delete", table, input };
+}
+
+export function buildUpdate(stmt: UpdateStmt, catalog: Catalog): LogicalUpdate {
+  const table = catalog.requireTable(stmt.table);
+  requireWritable(table);
+  if (stmt.assignments.length === 0) throw new PlanError("UPDATE has no assignments");
+
+  const seen = new Set<number>();
+  const assignments: ResolvedAssignment[] = stmt.assignments.map((a) => {
+    const index = columnIndex(table.schema, a.column); // throws if unknown
+    if (seen.has(index)) throw new PlanError(`column "${a.column}" assigned more than once`);
+    seen.add(index);
+    validateExpr(a.value, table.schema); // value may reference existing columns
+    return { index, value: a.value };
+  });
+
+  let input: LogicalPlan = { kind: "scan", table };
+  if (stmt.where) {
+    validateExpr(stmt.where, table.schema);
+    input = { kind: "filter", predicate: stmt.where, input };
+  }
+  return { kind: "update", table, assignments, input };
 }
 
 /** Extract the literal value from an INSERT value slot (params are bound earlier). */

@@ -5,9 +5,10 @@ import { sortCompare } from "../record/value.js";
 import { BTree } from "../storage/btree.js";
 import type { Rid } from "../storage/rid.js";
 import type { Expr } from "../sql/ast.js";
+import type { ResolvedAssignment } from "../plan/logical.js";
 import type { PhysicalPlan } from "../plan/physical.js";
 import type { ExecContext } from "./context.js";
-import { compilePredicate } from "./eval.js";
+import { type CompiledExpr, compileExpr, compilePredicate } from "./eval.js";
 import type { ScannedRow } from "./table-store.js";
 
 /** A tuple flowing through the operator pipeline. */
@@ -284,6 +285,56 @@ class InsertOp implements Operator {
   }
 }
 
+/**
+ * Apply SET assignments to each row matched by the child. The full target set is
+ * materialized before any write so an UPDATE that relocates rows (or changes an
+ * indexed key driving the scan) never re-processes a row it just wrote — the
+ * Halloween problem. Each new value is computed against the row's OLD values.
+ */
+class UpdateOp implements Operator {
+  readonly columns: Column[];
+  private readonly setters: { readonly index: number; readonly compute: CompiledExpr }[];
+  private pending: ExecTuple[] = [];
+  private pos = 0;
+
+  constructor(
+    private readonly ctx: ExecContext,
+    private readonly table: TableMeta,
+    private readonly child: Operator,
+    assignments: ResolvedAssignment[],
+  ) {
+    this.columns = table.columns;
+    this.setters = assignments.map((a) => ({
+      index: a.index,
+      compute: compileExpr(a.value, table.columns),
+    }));
+  }
+
+  open(): void {
+    this.child.open();
+    this.pending = [];
+    try {
+      for (let t = this.child.next(); t !== null; t = this.child.next()) this.pending.push(t);
+    } finally {
+      this.child.close();
+    }
+    this.pos = 0;
+  }
+
+  next(): ExecTuple | null {
+    if (this.pos >= this.pending.length) return null;
+    const row = this.pending[this.pos++]!;
+    const newValues = row.values.slice();
+    for (const s of this.setters) newValues[s.index] = s.compute(row.values);
+    const newRid = this.ctx.store.updateRow(this.ctx.tx, this.table, row, newValues);
+    return { rowid: row.rowid, rid: newRid, values: newValues };
+  }
+
+  close(): void {
+    this.pending = [];
+  }
+}
+
 /** Delete each row pulled from the child; emits the deleted tuples. */
 class DeleteOp implements Operator {
   readonly columns: Column[];
@@ -335,6 +386,8 @@ export function buildOperator(plan: PhysicalPlan, ctx: ExecContext): Operator {
       return new LimitOp(buildOperator(plan.input, ctx), plan.limit);
     case "Insert":
       return new InsertOp(ctx, plan.table, plan.rows);
+    case "Update":
+      return new UpdateOp(ctx, plan.table, buildOperator(plan.input, ctx), plan.assignments);
     case "Delete":
       return new DeleteOp(ctx, plan.table, buildOperator(plan.input, ctx));
   }

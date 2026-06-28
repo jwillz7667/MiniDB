@@ -111,6 +111,13 @@ export function recordOffset(page: Buffer, slot: number): number {
   return offset;
 }
 
+/** Byte length of the live record at `slot`. Throws if the slot is tombstoned. */
+export function recordLength(page: Buffer, slot: number): number {
+  assertSlot(page, slot);
+  if (slotOffset(page, slot) === 0) throw new SlottedPageError(`record at slot ${slot} is deleted`);
+  return slotLength(page, slot);
+}
+
 /** Return a copy of the record at `slot`. Throws if the slot is tombstoned. */
 export function getRecord(page: Buffer, slot: number): Buffer {
   assertSlot(page, slot);

@@ -51,6 +51,55 @@ export class TableStore {
     return rid;
   }
 
+  /**
+   * Replace a row's values, keeping its rowid. If the new tuple serializes to
+   * the same byte length it is overwritten in place, so the rid — and every
+   * index entry that points at it — stays valid and only changed index keys are
+   * re-pointed. Otherwise the record is relocated (delete + re-insert at a new
+   * rid) and all indexes are re-pointed to the new rid. Returns the new rid.
+   */
+  updateRow(tx: Tx, table: TableMeta, row: ScannedRow, newValues: Value[]): Rid {
+    if (!this.hasRowId(table)) {
+      throw new ExecutionError(`system table "${table.name}" is read-only`);
+    }
+    const tuple = serialize(table.schema, newValues); // validates types + NOT NULL
+    const bytes = Buffer.alloc(I64 + tuple.length);
+    bytes.writeBigInt64LE(row.rowid, 0);
+    tuple.copy(bytes, I64);
+
+    const indexes = this.catalog.getIndexes(table.name);
+    const current = this.heap.get(tx, row.rid);
+
+    if (current.length === bytes.length) {
+      this.heap.overwrite(tx, row.rid, bytes);
+      // Only re-point indexes whose key actually changed; the rid is unchanged.
+      for (const index of indexes) {
+        const col = columnIndex(table.schema, index.columnName);
+        const oldKey = row.values[col]!;
+        const newKey = newValues[col]!;
+        if (oldKey === newKey) continue;
+        if (oldKey !== null) BTree.delete(tx, index.root, oldKey as bigint, row.rid);
+        if (newKey !== null) BTree.insert(tx, index.root, newKey as bigint, row.rid);
+      }
+      return row.rid;
+    }
+
+    // Length changed: relocate. Tombstone the old record and append a new one,
+    // then move the primary and every secondary index entry to the new rid.
+    this.heap.delete(tx, row.rid);
+    const newRid = this.heap.insert(tx, table.heapRoot, bytes);
+    BTree.delete(tx, table.pkRoot, row.rowid, row.rid);
+    BTree.insert(tx, table.pkRoot, row.rowid, newRid);
+    for (const index of indexes) {
+      const col = columnIndex(table.schema, index.columnName);
+      const oldKey = row.values[col]!;
+      const newKey = newValues[col]!;
+      if (oldKey !== null) BTree.delete(tx, index.root, oldKey as bigint, row.rid);
+      if (newKey !== null) BTree.insert(tx, index.root, newKey as bigint, newRid);
+    }
+    return newRid;
+  }
+
   /** Tombstone a row and remove it from the primary and secondary indexes. */
   deleteRow(tx: Tx, table: TableMeta, row: ScannedRow): void {
     if (!this.hasRowId(table)) {

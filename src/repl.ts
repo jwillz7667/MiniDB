@@ -132,6 +132,9 @@ function printResult(result: ExecResult): void {
     case "insert":
       process.stdout.write(`inserted ${result.rowCount}\n`);
       return;
+    case "update":
+      process.stdout.write(`updated ${result.rowCount}\n`);
+      return;
     case "delete":
       process.stdout.write(`deleted ${result.rowCount}\n`);
       return;

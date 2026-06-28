@@ -7,6 +7,7 @@ import type {
   InsertStmt,
   SelectStmt,
   Statement,
+  UpdateStmt,
   ValueExpr,
 } from "./ast.js";
 
@@ -62,6 +63,8 @@ function rewrite(stmt: Statement, params: readonly LiteralValue[]): Statement {
       return rewriteSelect(stmt, params);
     case "insert":
       return rewriteInsert(stmt, params);
+    case "update":
+      return rewriteUpdate(stmt, params);
     case "delete":
       return rewriteDelete(stmt, params);
     case "explain":
@@ -81,6 +84,14 @@ function rewriteSelect(stmt: SelectStmt, params: readonly LiteralValue[]): Selec
 
 function rewriteDelete(stmt: DeleteStmt, params: readonly LiteralValue[]): DeleteStmt {
   return stmt.where === null ? stmt : { ...stmt, where: bindExpr(stmt.where, params) };
+}
+
+function rewriteUpdate(stmt: UpdateStmt, params: readonly LiteralValue[]): UpdateStmt {
+  return {
+    ...stmt,
+    assignments: stmt.assignments.map((a) => ({ ...a, value: bindExpr(a.value, params) })),
+    where: stmt.where === null ? null : bindExpr(stmt.where, params),
+  };
 }
 
 function rewriteExplain(stmt: ExplainStmt, params: readonly LiteralValue[]): ExplainStmt {

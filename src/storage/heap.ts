@@ -6,9 +6,12 @@ import {
   initSlottedPage,
   insertRecord,
   isDeleted,
+  recordLength,
+  recordOffset,
   setNextPage,
   slotCount,
 } from "./page.js";
+import { SlottedPageError } from "../errors.js";
 import type { Rid } from "./rid.js";
 import type { Tx } from "./tx.js";
 
@@ -75,6 +78,25 @@ export class Heap {
   /** Tombstone the record at `rid`. */
   delete(tx: Tx, rid: Rid): void {
     tx.modify(rid.pageNo, (page) => deleteRecord(page, rid.slot));
+  }
+
+  /**
+   * Overwrite the record at `rid` in place. The new bytes MUST be exactly the
+   * length of the existing record (the slotted layout cannot grow a record
+   * without relocating it); callers that change the length delete + re-insert
+   * instead. Used by same-length UPDATEs to keep the rid — and therefore every
+   * index entry — stable.
+   */
+  overwrite(tx: Tx, rid: Rid, bytes: Buffer): void {
+    tx.modify(rid.pageNo, (page) => {
+      const len = recordLength(page, rid.slot);
+      if (len !== bytes.length) {
+        throw new SlottedPageError(
+          `overwrite length ${bytes.length} != record length ${len} at ${rid.pageNo}:${rid.slot}`,
+        );
+      }
+      bytes.copy(page, recordOffset(page, rid.slot));
+    });
   }
 
   /** Yield every live record across the chain, in physical (page, slot) order. */

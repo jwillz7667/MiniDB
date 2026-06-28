@@ -32,6 +32,7 @@ export function optimize(plan: LogicalPlan, catalog: Catalog): LogicalPlan {
     case "project":
     case "sort":
     case "limit":
+    case "update":
     case "delete":
       return { ...plan, input: optimize(plan.input, catalog) };
   }
