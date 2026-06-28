@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+*.log
+
+# Local scratch databases produced by demos / manual runs
+*.minidb
+*.minidb-wal
+/.scratch/
+/tmp/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.tsbuildinfo
