@@ -75,48 +75,58 @@ export class Database {
 
   private static openLocked(path: string, options: DatabaseOptions, lock: FileLock): Database {
     const durability = new Durability(options.synchronous ?? "full");
+    // Close the file descriptors if anything below throws before the returned
+    // Database (which owns and closes them) is constructed — otherwise a failed
+    // open on a corrupt file leaks fds until EMFILE.
     const pager = Pager.open(path, durability);
-    const wal = Wal.open(`${path}-wal`, durability);
+    let wal: Wal | undefined;
+    try {
+      wal = Wal.open(`${path}-wal`, durability);
 
-    // Replay the WAL into the data file before anything caches a page.
-    const recovery = recover(pager, wal);
-    if (recovery.records > 0) {
-      wal.truncate();
-      wal.setNextLsn(recovery.maxLsn + 1n);
+      // Replay the WAL into the data file before anything caches a page.
+      const recovery = recover(pager, wal);
+      if (recovery.records > 0) {
+        wal.truncate();
+        wal.setNextLsn(recovery.maxLsn + 1n);
+      }
+
+      const pool = new BufferPool(pager, options.poolSize ?? 256);
+      pool.setBeforeFlush(() => wal!.flush()); // write-ahead rule
+
+      const heap = new Heap();
+      const fresh = pager.getCatalogRoot() === INVALID_PAGE;
+      // Bootstrap/load the catalog directly (the cold-start path is fsync'd, not
+      // logged); subsequent DDL/DML go through the WAL.
+      const catalog = Catalog.open(new DirectTx(pool), pager, heap);
+      if (fresh) {
+        // Order matters: make the catalog pages durable, THEN record the header
+        // pointer to them. A crash before the pointer is written simply re-runs a
+        // fresh bootstrap; the reverse order could point the header at unwritten
+        // pages and leave the database unopenable.
+        pool.flushAll();
+        pager.setCatalogRoot(catalog.rootPage());
+      }
+
+      const store = new TableStore(catalog, heap);
+      const rowids = new RowIdAllocator();
+      return new Database(
+        pager,
+        pool,
+        wal,
+        catalog,
+        store,
+        heap,
+        rowids,
+        new DirectTx(pool),
+        lock,
+        options.maxSortRows ?? DEFAULT_MAX_SORT_ROWS,
+        recovery,
+      );
+    } catch (err) {
+      wal?.close();
+      pager.close();
+      throw err;
     }
-
-    const pool = new BufferPool(pager, options.poolSize ?? 256);
-    pool.setBeforeFlush(() => wal.flush()); // write-ahead rule
-
-    const heap = new Heap();
-    const fresh = pager.getCatalogRoot() === INVALID_PAGE;
-    // Bootstrap/load the catalog directly (the cold-start path is fsync'd, not
-    // logged); subsequent DDL/DML go through the WAL.
-    const catalog = Catalog.open(new DirectTx(pool), pager, heap);
-    if (fresh) {
-      // Order matters: make the catalog pages durable, THEN record the header
-      // pointer to them. A crash before the pointer is written simply re-runs a
-      // fresh bootstrap; the reverse order could point the header at unwritten
-      // pages and leave the database unopenable.
-      pool.flushAll();
-      pager.setCatalogRoot(catalog.rootPage());
-    }
-
-    const store = new TableStore(catalog, heap);
-    const rowids = new RowIdAllocator();
-    return new Database(
-      pager,
-      pool,
-      wal,
-      catalog,
-      store,
-      heap,
-      rowids,
-      new DirectTx(pool),
-      lock,
-      options.maxSortRows ?? DEFAULT_MAX_SORT_ROWS,
-      recovery,
-    );
   }
 
   /** Execute one SQL statement. */

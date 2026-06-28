@@ -8,9 +8,12 @@ import { LockError } from "../errors.js";
  * file — in one process or across processes — would corrupt it.
  *
  * On open we atomically create `<path>-lock` (O_EXCL) and write our PID. If it
- * already exists, we treat it as stale and reclaim it only when its owner PID is
- * no longer alive (the normal aftermath of a crash); otherwise we refuse. This
- * is advisory: it protects cooperating minidb processes, not arbitrary writers.
+ * already exists we reclaim it ONLY when it is owned by a confirmed-dead numeric
+ * PID (the normal aftermath of a crash). A live owner — or an empty/unreadable
+ * lock that a concurrent opener may be mid-write on — is refused rather than
+ * stolen, so two openers can never both acquire. This is advisory: it protects
+ * cooperating minidb processes, not arbitrary writers, and (like any PID-file
+ * lock) cannot fully disambiguate a recycled PID — a kernel `flock` would.
  */
 export class FileLock {
   private released = false;
@@ -19,23 +22,31 @@ export class FileLock {
 
   static acquire(dbPath: string): FileLock {
     const lockPath = `${dbPath}-lock`;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let fd: number;
       try {
-        const fd = openSync(lockPath, "wx"); // O_CREAT | O_EXCL
-        writeSync(fd, String(process.pid));
-        closeSync(fd);
-        return new FileLock(lockPath);
+        fd = openSync(lockPath, "wx"); // O_CREAT | O_EXCL
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
         const owner = readOwner(lockPath);
-        if (owner !== null && isAlive(owner)) {
-          throw new LockError(
-            `database is already open (locked by process ${owner}); ` +
-              `close the other instance or remove ${lockPath} if it is stale`,
-          );
+        if (owner !== null && !isAlive(owner)) {
+          rmSync(lockPath, { force: true }); // stale lock from a dead process — reclaim
+          continue;
         }
-        rmSync(lockPath, { force: true }); // stale lock from a dead process — reclaim
+        throw new LockError(
+          `database is already open (locked by ${owner === null ? "another process" : `process ${owner}`}); ` +
+            `close the other instance or remove ${lockPath} if it is stale`,
+        );
       }
+      try {
+        writeSync(fd, String(process.pid));
+      } catch (err) {
+        closeSync(fd);
+        rmSync(lockPath, { force: true }); // don't leave an empty orphan lock behind
+        throw err;
+      }
+      closeSync(fd);
+      return new FileLock(lockPath);
     }
     throw new LockError(`could not acquire the database lock at ${lockPath}`);
   }
