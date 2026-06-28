@@ -34,6 +34,8 @@ export const KEYWORDS: ReadonlySet<string> = new Set([
   "DESC",
   "LIMIT",
   "DELETE",
+  "UPDATE",
+  "SET",
   "AND",
   "OR",
   "NOT",

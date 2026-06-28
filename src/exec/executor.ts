@@ -10,8 +10,15 @@ import type {
   InsertStmt,
   SelectStmt,
   Statement,
+  UpdateStmt,
 } from "../sql/ast.js";
-import { buildDelete, buildInsert, buildSelect, type LogicalPlan } from "../plan/logical.js";
+import {
+  buildDelete,
+  buildInsert,
+  buildSelect,
+  buildUpdate,
+  type LogicalPlan,
+} from "../plan/logical.js";
 import { optimize } from "../plan/optimizer.js";
 import { explain, toPhysical } from "../plan/physical.js";
 import type { ExecContext } from "./context.js";
@@ -25,6 +32,7 @@ export type QueryResult =
       /** Internal rowid of the last row inserted, or null if none were. */
       readonly lastInsertRowid: bigint | null;
     }
+  | { readonly type: "update"; readonly rowCount: number }
   | { readonly type: "delete"; readonly rowCount: number }
   | { readonly type: "createTable"; readonly table: string }
   | { readonly type: "createIndex"; readonly table: string; readonly column: string }
@@ -52,6 +60,8 @@ export class Executor {
         return this.select(stmt);
       case "insert":
         return this.insert(stmt);
+      case "update":
+        return this.update(stmt);
       case "delete":
         return this.delete(stmt);
       case "explain":
@@ -107,6 +117,11 @@ export class Executor {
     };
   }
 
+  private update(stmt: UpdateStmt): QueryResult {
+    const plan = toPhysical(optimize(buildUpdate(stmt, this.catalog), this.catalog));
+    return { type: "update", rowCount: this.drain(buildOperator(plan, this.ctx)).length };
+  }
+
   private delete(stmt: DeleteStmt): QueryResult {
     const plan = toPhysical(optimize(buildDelete(stmt, this.catalog), this.catalog));
     return { type: "delete", rowCount: this.drain(buildOperator(plan, this.ctx)).length };
@@ -117,6 +132,7 @@ export class Executor {
     let logical: LogicalPlan;
     if (inner.kind === "select") logical = buildSelect(inner, this.catalog);
     else if (inner.kind === "insert") logical = buildInsert(inner, this.catalog);
+    else if (inner.kind === "update") logical = buildUpdate(inner, this.catalog);
     else logical = buildDelete(inner, this.catalog);
     return { type: "explain", lines: explain(toPhysical(optimize(logical, this.catalog))) };
   }

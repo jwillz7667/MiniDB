@@ -2,7 +2,7 @@ import type { TableMeta } from "../record/catalog.js";
 import { type Column, columnIndex, type Value } from "../record/schema.js";
 import { valueToLiteral } from "../record/value.js";
 import type { Expr, SortDir } from "../sql/ast.js";
-import type { LogicalPlan } from "./logical.js";
+import type { LogicalPlan, ResolvedAssignment } from "./logical.js";
 
 const I64_MIN = -9_223_372_036_854_775_808n;
 const I64_MAX = 9_223_372_036_854_775_807n;
@@ -20,6 +20,7 @@ export type PhysicalPlan =
   | PhysSort
   | PhysLimit
   | PhysInsert
+  | PhysUpdate
   | PhysDelete;
 
 export interface PhysSeqScan {
@@ -69,6 +70,13 @@ export interface PhysInsert {
   readonly columns: Column[];
   readonly rows: Value[][];
 }
+export interface PhysUpdate {
+  readonly op: "Update";
+  readonly table: TableMeta;
+  readonly columns: Column[];
+  readonly assignments: ResolvedAssignment[];
+  readonly input: PhysicalPlan;
+}
 export interface PhysDelete {
   readonly op: "Delete";
   readonly table: TableMeta;
@@ -116,6 +124,16 @@ export function toPhysical(plan: LogicalPlan, limitHint?: number): PhysicalPlan 
     }
     case "insert":
       return { op: "Insert", table: plan.table, columns: plan.table.columns, rows: plan.rows };
+    case "update": {
+      const input = toPhysical(plan.input);
+      return {
+        op: "Update",
+        table: plan.table,
+        columns: plan.table.columns,
+        assignments: plan.assignments,
+        input,
+      };
+    }
     case "delete": {
       const input = toPhysical(plan.input);
       return { op: "Delete", table: plan.table, columns: plan.table.columns, input };
@@ -129,6 +147,7 @@ function childOf(plan: PhysicalPlan): PhysicalPlan | null {
     case "Project":
     case "Sort":
     case "Limit":
+    case "Update":
     case "Delete":
       return plan.input;
     default:
@@ -161,6 +180,12 @@ function nodeLabel(plan: PhysicalPlan): string {
       return `Limit ${plan.limit}`;
     case "Insert":
       return `Insert ${plan.table.name} (${plan.rows.length} row${plan.rows.length === 1 ? "" : "s"})`;
+    case "Update": {
+      const sets = plan.assignments
+        .map((a) => `${plan.columns[a.index]!.name} = ${printExpr(a.value)}`)
+        .join(", ");
+      return `Update ${plan.table.name} SET ${sets}`;
+    }
     case "Delete":
       return `Delete ${plan.table.name}`;
   }

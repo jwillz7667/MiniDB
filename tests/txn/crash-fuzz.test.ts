@@ -69,12 +69,19 @@ describe("crash-injection fuzzer", () => {
   /** Apply one random committed/aborted operation, keeping the oracle in step. */
   function step(db: Database, oracle: Oracle, rng: () => number, nextId: { v: number }): void {
     const choice = rng();
-    if (choice < 0.5) {
+    if (choice < 0.45) {
       const id = nextId.v++;
       const v = Math.floor(rng() * V_RANGE);
       db.exec(`INSERT INTO t (id, v) VALUES (${id}, ${v})`);
       oracle.rows.set(id, v);
-    } else if (choice < 0.7 && oracle.rows.size > 0) {
+    } else if (choice < 0.6 && oracle.rows.size > 0) {
+      // In-place UPDATE of an indexed column: re-points the secondary index.
+      const ids = [...oracle.rows.keys()];
+      const id = ids[Math.floor(rng() * ids.length)]!;
+      const v = Math.floor(rng() * V_RANGE);
+      db.prepare("UPDATE t SET v = ? WHERE id = ?").run(v, id);
+      oracle.rows.set(id, v);
+    } else if (choice < 0.72 && oracle.rows.size > 0) {
       const ids = [...oracle.rows.keys()];
       const id = ids[Math.floor(rng() * ids.length)]!;
       db.exec(`DELETE FROM t WHERE id = ${id}`);

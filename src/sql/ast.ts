@@ -59,6 +59,7 @@ export type Statement =
   | CreateIndexStmt
   | InsertStmt
   | SelectStmt
+  | UpdateStmt
   | DeleteStmt
   | ExplainStmt
   | TxnStmt;
@@ -105,9 +106,23 @@ export interface DeleteStmt {
   readonly where: Expr | null;
 }
 
+/** A single `col = <value>` assignment in an UPDATE. */
+export interface Assignment {
+  readonly column: string;
+  /** Evaluated against the existing row; a literal, `?` placeholder, or column. */
+  readonly value: Expr;
+}
+
+export interface UpdateStmt {
+  readonly kind: "update";
+  readonly table: string;
+  readonly assignments: Assignment[];
+  readonly where: Expr | null;
+}
+
 export interface ExplainStmt {
   readonly kind: "explain";
-  readonly statement: SelectStmt | InsertStmt | DeleteStmt;
+  readonly statement: SelectStmt | InsertStmt | UpdateStmt | DeleteStmt;
 }
 
 export interface TxnStmt {

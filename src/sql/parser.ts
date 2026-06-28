@@ -1,6 +1,7 @@
 import { ParseError } from "../errors.js";
 import type { ColumnType } from "../record/schema.js";
 import type {
+  Assignment,
   ColumnDef,
   CompareOp,
   DeleteStmt,
@@ -9,6 +10,7 @@ import type {
   LiteralValue,
   SelectStmt,
   Statement,
+  UpdateStmt,
   ValueExpr,
 } from "./ast.js";
 import { tokenize } from "./lexer.js";
@@ -140,6 +142,8 @@ class Parser {
         return this.parseInsert();
       case "SELECT":
         return this.parseSelect();
+      case "UPDATE":
+        return this.parseUpdate();
       case "DELETE":
         return this.parseDelete();
       case "EXPLAIN":
@@ -277,11 +281,34 @@ class Parser {
     return { kind: "delete", table, where };
   }
 
+  private parseUpdate(): UpdateStmt {
+    this.expectKeyword("UPDATE");
+    const table = this.expectIdentifier("a table name");
+    this.expectKeyword("SET");
+
+    const assignments: Assignment[] = [];
+    do {
+      const column = this.expectIdentifier("a column name");
+      this.expect("operator", "=", '"=" in a SET assignment');
+      // An assignment value is a single term (literal, ?, or column) — not a
+      // comparison — so `SET a = b` reads column b rather than a boolean.
+      assignments.push({ column, value: this.parsePrimary() });
+    } while (this.match("punctuation", ","));
+
+    const where = this.matchKeyword("WHERE") ? this.parseExpr() : null;
+    return { kind: "update", table, assignments, where };
+  }
+
   private parseExplain(): Statement {
     this.expectKeyword("EXPLAIN");
     const inner = this.parseStatement();
-    if (inner.kind !== "select" && inner.kind !== "insert" && inner.kind !== "delete") {
-      throw this.error("EXPLAIN only supports SELECT, INSERT, and DELETE");
+    if (
+      inner.kind !== "select" &&
+      inner.kind !== "insert" &&
+      inner.kind !== "update" &&
+      inner.kind !== "delete"
+    ) {
+      throw this.error("EXPLAIN only supports SELECT, INSERT, UPDATE, and DELETE");
     }
     return { kind: "explain", statement: inner };
   }
