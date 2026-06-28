@@ -173,6 +173,13 @@ class SortOp implements Operator {
     for (let t = this.child.next(); t !== null; t = this.child.next()) {
       if (n === 0) continue;
       if (kept.length < n) {
+        // A LIMIT larger than the cap must still fail safe rather than buffer
+        // the whole table (do NOT clamp n — that would change results).
+        if (kept.length >= this.maxRows) {
+          throw new ExecutionError(
+            `ORDER BY buffered more than ${this.maxRows} rows; lower the LIMIT or add a tighter WHERE`,
+          );
+        }
         this.insertSorted(kept, t);
       } else if (this.cmp(t, kept[kept.length - 1]!) < 0) {
         kept.pop();
