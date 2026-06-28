@@ -1,4 +1,4 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, rmSync } from "node:fs";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -12,7 +12,12 @@ import { makeTempDb, type TempDb } from "../helpers/tmp.js";
  */
 describe("crash recovery", () => {
   let tmp: TempDb;
-  const open = (): Database => Database.open(tmp.path);
+  // A crash kills the process, so its lock becomes stale and the next process
+  // reclaims it. In-process we model that by clearing the lock before reopening.
+  const open = (): Database => {
+    rmSync(`${tmp.path}-lock`, { force: true });
+    return Database.open(tmp.path);
+  };
   const ids = (db: Database, sql: string): bigint[] => {
     const r = db.exec(sql);
     if (r.type !== "select") throw new Error("expected select");

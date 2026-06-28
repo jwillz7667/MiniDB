@@ -68,9 +68,15 @@ transparently.
 - **Storage**: on-disk B+Tree (point lookups + ordered range scans), slotted heap pages,
   a buffer pool with clock (second-chance) eviction.
 - **Durability**: write-ahead logging with the STEAL + NO-FORCE policy and ARIES-lite redo /
-  undo recovery, checkpointing, and CRC32-guarded log records that tolerate torn writes.
+  undo recovery (with logged compensation records), checkpointing, and CRC32 on both log
+  records and **every data page**, so torn writes and bit-rot are detected, not silently
+  served. Configurable sync modes (`full` / `normal` / `off`) and a directory fsync on
+  create.
 - **Concurrency**: MVCC with snapshot isolation — versioned tuples (`xmin`/`xmax`), per-
-  transaction snapshots, and first-updater-wins conflict detection.
+  transaction snapshots, and first-updater-wins conflict detection. A PID lock keeps two
+  instances from opening (and corrupting) the same file.
+- **Resource safety**: `ORDER BY … LIMIT n` keeps only a bounded top-N; an unbounded
+  `ORDER BY` is capped and fails safe instead of exhausting memory.
 - **Optimizer**: predicate pushdown into the access method and index selection, both visible
   in `EXPLAIN`.
 
@@ -80,7 +86,7 @@ transparently.
 
 ```bash
 pnpm install
-pnpm test          # 101 tests across all 8 phases
+pnpm test          # 117 tests, incl. a power-loss crash fuzzer
 pnpm repl          # interactive SQL shell
 ```
 
@@ -219,6 +225,23 @@ scripts/                  demo-pool, demo-crash, demo-explain
 docs/db-engine-spec.md    the original build spec
 ```
 
+## Durability testing
+
+Durability is the product, so it is tested as such. A **deterministic crash-injection fuzzer**
+(`tests/txn/crash-fuzz.test.ts`) runs randomized workloads — autocommit and explicit
+commit/rollback transactions over an indexed table — then simulates a **power loss** and
+recovers. The crash model is faithful: a `CrashSim` helper snapshots each file at every fsync
+and, on crash, reverts it to its last fsync'd image, so anything not durably synced actually
+disappears (a same-process reopen alone can't test this — it shares the OS cache). Recovery
+must then exactly match a reference oracle of committed state, with the secondary index
+agreeing with the heap for every value. The harness has teeth in both directions: reverting the
+aborted-transaction recovery fix makes it fail, and so does removing the commit fsync (a
+meta-test confirms that in `off` mode a crash loses committed data).
+
+> Honest caveat: on macOS, `fsync(2)` does not flush the drive's write cache — true power-loss
+> durability needs `fcntl(F_FULLFSYNC)`, which Node cannot issue without a native addon. The
+> `Durability` layer is the single seam where a platform-correct full-sync would plug in.
+
 ## Known limitations (deliberate)
 
 Deferred reclamation, by design: deletes are **tombstones** (B+Tree entries and heap slots),
@@ -226,7 +249,9 @@ B+Tree nodes are never merged or rebalanced, and rolled-back/dead versions leak 
 vacuum/compaction pass would reclaim all of it. Rows must fit within a single page (no overflow
 pages). Secondary indexes are on `INT` columns only. DDL inside an explicit transaction is
 rejected (it would desynchronize the in-memory catalog from an on-disk rollback). The engine is
-single-writer.
+single-writer, enforced by an advisory PID lock — which, like any PID-file lock, can't fully
+disambiguate a recycled PID (a kernel `flock` would); it fails closed, never corrupting. There
+is no `JOIN` or `UPDATE` statement yet.
 
 ## License
 

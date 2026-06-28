@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { closeSync, openSync, readSync, writeFileSync, writeSync } from "node:fs";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -81,6 +81,34 @@ describe("Pager", () => {
     const pager = Pager.open(tmp.path);
     expect(() => pager.readPage(5)).toThrow(PageError);
     pager.close();
+  });
+
+  it("detects bit-rot / torn writes via the per-page checksum", () => {
+    const pager = Pager.open(tmp.path);
+    const pageNo = pager.allocatePage();
+    const buf = Buffer.alloc(PAGE_SIZE);
+    buf.write("important", 0, "utf8");
+    pager.writePage(pageNo, buf, true);
+    pager.close();
+
+    // Flip a byte in the page's content area on disk.
+    const fd = openSync(tmp.path, "r+");
+    const corrupt = Buffer.from([0x00]);
+    readSync(fd, corrupt, 0, 1, pageNo * PAGE_SIZE + 2);
+    writeSync(fd, Buffer.from([corrupt[0]! ^ 0xff]), 0, 1, pageNo * PAGE_SIZE + 2);
+    closeSync(fd);
+
+    const reopened = Pager.open(tmp.path);
+    expect(() => reopened.readPage(pageNo)).toThrow(CorruptDatabaseError);
+    reopened.close();
+  });
+
+  it("detects a corrupt header", () => {
+    Pager.open(tmp.path).close();
+    const fd = openSync(tmp.path, "r+");
+    writeSync(fd, Buffer.from([0xff]), 0, 1, 16); // clobber a header field
+    closeSync(fd);
+    expect(() => Pager.open(tmp.path)).toThrow(CorruptDatabaseError);
   });
 
   it("grows the file to satisfy ensurePageCount (recovery path)", () => {

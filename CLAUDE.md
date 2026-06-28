@@ -80,6 +80,22 @@ pool depends on pager. **This order is load-bearing — do not reorder phases.**
   testable.
 - **Each WAL record carries a CRC32.** Replay stops at the first record with a bad/short
   checksum — that is the crash point. This is how torn trailing writes are tolerated.
+- **Every data page carries a CRC32 too** (format v2). The pager reserves each page's last 4
+  bytes (`PAGE_CHECKSUM_SIZE`) for it; access methods must size content with
+  `USABLE_PAGE_SIZE`, never `PAGE_SIZE`. A read with a bad checksum throws
+  `CorruptDatabaseError`; an all-zero page is a valid freshly-allocated page.
+- **All fsyncs flow through `storage/durability.ts`** (`full`/`normal`/`off` modes, directory
+  fsync on create, and a test-only fault hook for crash injection). macOS `F_FULLFSYNC` is a
+  documented gap; this is the seam to plug it in. The WAL distinguishes hard `barrier` flushes
+  (write-ahead, checkpoint) from relaxed `commitBarrier` flushes.
+- **One writer per file.** `Database.open` takes a `<path>-lock` (PID, O_EXCL); a second live
+  instance is refused (`LockError`), a dead instance's lock is reclaimed. Crash-sim tests must
+  clear the lock before reopening (a real crash makes it stale).
+- **Sort is memory-bounded.** A known `LIMIT` is pushed through `Project` into `Sort` (top-N);
+  an unbounded `ORDER BY` is capped at `maxSortRows` and fails safe.
+- **Durability is fuzzed, not just spot-checked.** `tests/txn/crash-fuzz.test.ts` is the
+  oracle-backed crash harness; if you touch recovery/WAL/pager, it must stay green (and if you
+  fix a durability bug, confirm the fuzzer catches the regression).
 - **Tombstone deletes only** (B+Tree entries and heap slots). No merge/rebalance, no page
   reclamation, no vacuum yet — documented as a known limitation, matching the spec.
 

@@ -6,6 +6,7 @@ coverage/
 # Local scratch databases produced by demos / manual runs
 *.minidb
 *.minidb-wal
+*.minidb-lock
 /.scratch/
 /tmp/
 
@@ -14,3 +15,7 @@ coverage/
 .idea/
 .vscode/
 *.tsbuildinfo
+
+db-engine-spec.md
+
+docs/

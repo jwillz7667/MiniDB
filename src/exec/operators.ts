@@ -1,3 +1,4 @@
+import { ExecutionError } from "../errors.js";
 import type { TableMeta } from "../record/catalog.js";
 import type { Column, Value } from "../record/schema.js";
 import { sortCompare } from "../record/value.js";
@@ -134,7 +135,12 @@ class ProjectOp implements Operator {
   }
 }
 
-/** Buffer the child fully, then emit rows in sorted order (in-memory sort). */
+/**
+ * Sort the child's rows in memory. When an enclosing LIMIT is known, only the
+ * top-N rows are retained (bounded memory); otherwise the full result is
+ * buffered, but capped at `maxRows` so a runaway ORDER BY fails safe instead of
+ * exhausting memory.
+ */
 class SortOp implements Operator {
   readonly columns: Column[];
   private buffer: ExecTuple[] = [];
@@ -144,19 +150,68 @@ class SortOp implements Operator {
     private readonly child: Operator,
     private readonly sortIndex: number,
     private readonly dir: "ASC" | "DESC",
+    private readonly limit: number | undefined,
+    private readonly maxRows: number,
   ) {
     this.columns = child.columns;
   }
 
+  private cmp(a: ExecTuple, b: ExecTuple): number {
+    const sign = this.dir === "DESC" ? -1 : 1;
+    return sign * sortCompare(a.values[this.sortIndex]!, b.values[this.sortIndex]!);
+  }
+
   open(): void {
     this.child.open();
-    this.buffer = [];
-    for (let t = this.child.next(); t !== null; t = this.child.next()) this.buffer.push(t);
-    const sign = this.dir === "DESC" ? -1 : 1;
-    this.buffer.sort(
-      (a, b) => sign * sortCompare(a.values[this.sortIndex]!, b.values[this.sortIndex]!),
-    );
     this.pos = 0;
+    this.buffer = this.limit !== undefined ? this.topN(this.limit) : this.bufferAll();
+  }
+
+  /** Keep a sorted array of at most `n` rows, dropping the worst on overflow. */
+  private topN(n: number): ExecTuple[] {
+    const kept: ExecTuple[] = [];
+    for (let t = this.child.next(); t !== null; t = this.child.next()) {
+      if (n === 0) continue;
+      if (kept.length < n) {
+        // A LIMIT larger than the cap must still fail safe rather than buffer
+        // the whole table (do NOT clamp n — that would change results).
+        if (kept.length >= this.maxRows) {
+          throw new ExecutionError(
+            `ORDER BY buffered more than ${this.maxRows} rows; lower the LIMIT or add a tighter WHERE`,
+          );
+        }
+        this.insertSorted(kept, t);
+      } else if (this.cmp(t, kept[kept.length - 1]!) < 0) {
+        kept.pop();
+        this.insertSorted(kept, t);
+      }
+    }
+    return kept;
+  }
+
+  private insertSorted(arr: ExecTuple[], t: ExecTuple): void {
+    let lo = 0;
+    let hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.cmp(arr[mid]!, t) <= 0) lo = mid + 1;
+      else hi = mid;
+    }
+    arr.splice(lo, 0, t);
+  }
+
+  private bufferAll(): ExecTuple[] {
+    const buf: ExecTuple[] = [];
+    for (let t = this.child.next(); t !== null; t = this.child.next()) {
+      buf.push(t);
+      if (buf.length > this.maxRows) {
+        throw new ExecutionError(
+          `ORDER BY buffered more than ${this.maxRows} rows; add a LIMIT or a tighter WHERE`,
+        );
+      }
+    }
+    buf.sort((a, b) => this.cmp(a, b));
+    return buf;
   }
 
   next(): ExecTuple | null {
@@ -269,7 +324,13 @@ export function buildOperator(plan: PhysicalPlan, ctx: ExecContext): Operator {
     case "Project":
       return new ProjectOp(buildOperator(plan.input, ctx), plan.columns, plan.indices);
     case "Sort":
-      return new SortOp(buildOperator(plan.input, ctx), plan.sortIndex, plan.dir);
+      return new SortOp(
+        buildOperator(plan.input, ctx),
+        plan.sortIndex,
+        plan.dir,
+        plan.limit,
+        ctx.maxSortRows,
+      );
     case "Limit":
       return new LimitOp(buildOperator(plan.input, ctx), plan.limit);
     case "Insert":

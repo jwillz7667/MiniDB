@@ -33,4 +33,9 @@ export interface ExecContext {
   readonly catalog: Catalog;
   readonly store: TableStore;
   readonly rowids: RowIdAllocator;
+  /** Max rows an unbounded (no-LIMIT) Sort may buffer before failing safe. */
+  readonly maxSortRows: number;
 }
+
+/** Default cap for an unbounded in-memory sort. */
+export const DEFAULT_MAX_SORT_ROWS = 1_000_000;

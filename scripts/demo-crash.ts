@@ -37,6 +37,7 @@ try {
 
   // --- Session 2: reopen and recover. ---
   const walMb = statSync(`${path}-wal`).size / 1024;
+  rmSync(`${path}-lock`, { force: true }); // the crashed process's lock is now stale
   const db2 = Database.open(path);
   const stats = db2.recoveryStats();
   out.write(`\n  reopened — replayed ${walMb.toFixed(1)} KB WAL: `);

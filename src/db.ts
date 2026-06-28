@@ -1,11 +1,13 @@
 import { INVALID_PAGE } from "./constants.js";
 import { TransactionError } from "./errors.js";
-import { RowIdAllocator, type ExecContext } from "./exec/context.js";
+import { DEFAULT_MAX_SORT_ROWS, RowIdAllocator, type ExecContext } from "./exec/context.js";
 import { Executor, type QueryResult } from "./exec/executor.js";
 import { TableStore } from "./exec/table-store.js";
 import { Catalog, type TableMeta } from "./record/catalog.js";
 import { BufferPool } from "./storage/bufferpool.js";
+import { Durability, type SyncMode } from "./storage/durability.js";
 import { Heap } from "./storage/heap.js";
+import { FileLock } from "./storage/lock.js";
 import { Pager } from "./storage/pager.js";
 import { DirectTx } from "./storage/tx.js";
 import { parse, parseMany } from "./sql/parser.js";
@@ -17,6 +19,10 @@ import { Wal } from "./txn/wal.js";
 export interface DatabaseOptions {
   /** Number of frames in the buffer pool. */
   readonly poolSize?: number;
+  /** Durability policy: "full" (default, safest), "normal", or "off". */
+  readonly synchronous?: SyncMode;
+  /** Max rows an unbounded (no-LIMIT) ORDER BY may buffer before failing safe. */
+  readonly maxSortRows?: number;
 }
 
 /** Result of a control statement plus everything the executor can return. */
@@ -47,6 +53,8 @@ export class Database {
     private readonly heap: Heap,
     private readonly rowids: RowIdAllocator,
     private readonly readTx: DirectTx,
+    private readonly lock: FileLock,
+    private readonly maxSortRows: number,
     recovery: RecoveryStats,
   ) {
     this.lastRecovery = recovery;
@@ -55,36 +63,70 @@ export class Database {
   }
 
   static open(path: string, options: DatabaseOptions = {}): Database {
-    const pager = Pager.open(path);
-    const wal = Wal.open(`${path}-wal`);
-
-    // Replay the WAL into the data file before anything caches a page.
-    const recovery = recover(pager, wal);
-    if (recovery.records > 0) {
-      wal.truncate();
-      wal.setNextLsn(recovery.maxLsn + 1n);
+    // Refuse to open a file another live instance holds (would corrupt it).
+    const lock = FileLock.acquire(path);
+    try {
+      return Database.openLocked(path, options, lock);
+    } catch (err) {
+      lock.release();
+      throw err;
     }
+  }
 
-    const pool = new BufferPool(pager, options.poolSize ?? 256);
-    pool.setBeforeFlush((pageLSN) => wal.flush(pageLSN)); // write-ahead rule
+  private static openLocked(path: string, options: DatabaseOptions, lock: FileLock): Database {
+    const durability = new Durability(options.synchronous ?? "full");
+    // Close the file descriptors if anything below throws before the returned
+    // Database (which owns and closes them) is constructed — otherwise a failed
+    // open on a corrupt file leaks fds until EMFILE.
+    const pager = Pager.open(path, durability);
+    let wal: Wal | undefined;
+    try {
+      wal = Wal.open(`${path}-wal`, durability);
 
-    const heap = new Heap();
-    const fresh = pager.getCatalogRoot() === INVALID_PAGE;
-    // Bootstrap/load the catalog directly (the cold-start path is fsync'd, not
-    // logged); subsequent DDL/DML go through the WAL.
-    const catalog = Catalog.open(new DirectTx(pool), pager, heap);
-    if (fresh) {
-      // Order matters: make the catalog pages durable, THEN record the header
-      // pointer to them. A crash before the pointer is written simply re-runs a
-      // fresh bootstrap; the reverse order could point the header at unwritten
-      // pages and leave the database unopenable.
-      pool.flushAll();
-      pager.setCatalogRoot(catalog.rootPage());
+      // Replay the WAL into the data file before anything caches a page.
+      const recovery = recover(pager, wal);
+      if (recovery.records > 0) {
+        wal.truncate();
+        wal.setNextLsn(recovery.maxLsn + 1n);
+      }
+
+      const pool = new BufferPool(pager, options.poolSize ?? 256);
+      pool.setBeforeFlush(() => wal!.flush()); // write-ahead rule
+
+      const heap = new Heap();
+      const fresh = pager.getCatalogRoot() === INVALID_PAGE;
+      // Bootstrap/load the catalog directly (the cold-start path is fsync'd, not
+      // logged); subsequent DDL/DML go through the WAL.
+      const catalog = Catalog.open(new DirectTx(pool), pager, heap);
+      if (fresh) {
+        // Order matters: make the catalog pages durable, THEN record the header
+        // pointer to them. A crash before the pointer is written simply re-runs a
+        // fresh bootstrap; the reverse order could point the header at unwritten
+        // pages and leave the database unopenable.
+        pool.flushAll();
+        pager.setCatalogRoot(catalog.rootPage());
+      }
+
+      const store = new TableStore(catalog, heap);
+      const rowids = new RowIdAllocator();
+      return new Database(
+        pager,
+        pool,
+        wal,
+        catalog,
+        store,
+        heap,
+        rowids,
+        new DirectTx(pool),
+        lock,
+        options.maxSortRows ?? DEFAULT_MAX_SORT_ROWS,
+        recovery,
+      );
+    } catch (err) {
+      wal?.close();
+      pager.close();
+      throw err;
     }
-
-    const store = new TableStore(catalog, heap);
-    const rowids = new RowIdAllocator();
-    return new Database(pager, pool, wal, catalog, store, heap, rowids, new DirectTx(pool), recovery);
   }
 
   /** Execute one SQL statement. */
@@ -110,6 +152,7 @@ export class Database {
         catalog: this.catalog,
         store: this.store,
         rowids: this.rowids,
+        maxSortRows: this.maxSortRows,
       };
       return new Executor(ctx, this.catalog).run(stmt);
     }
@@ -150,6 +193,7 @@ export class Database {
       catalog: this.catalog,
       store: this.store,
       rowids: this.rowids,
+      maxSortRows: this.maxSortRows,
     };
     return new Executor(ctx, this.catalog).run(stmt);
   }
@@ -163,16 +207,16 @@ export class Database {
   }
 
   private commit(tx: WalTx): void {
-    const lsn = this.wal.append({ type: "commit", txid: tx.txid });
-    this.wal.flush(lsn); // commit is durable only once its record is fsync'd
+    this.wal.append({ type: "commit", txid: tx.txid });
+    this.wal.flushForCommit(); // commit is durable once its record is flushed
     this.active.delete(tx.txid);
     tx.markFinished();
   }
 
   private rollback(tx: WalTx): void {
     tx.applyUndo();
-    const lsn = this.wal.append({ type: "abort", txid: tx.txid });
-    this.wal.flush(lsn);
+    this.wal.append({ type: "abort", txid: tx.txid });
+    this.wal.flushForCommit();
     this.active.delete(tx.txid);
     tx.markFinished();
     // The undo may have shrunk heap chains and rewound rowid/btree state, so
@@ -187,8 +231,8 @@ export class Database {
    */
   checkpoint(): void {
     this.pool.flushAll(); // honors the write-ahead rule via the flush hook
-    const lsn = this.wal.append({ type: "checkpoint", active: [...this.active] });
-    this.wal.flush(lsn);
+    this.wal.append({ type: "checkpoint", active: [...this.active] });
+    this.wal.flush(); // a checkpoint must be durable, so a hard barrier
     this.pager.setNextTxid(this.nextTxid);
   }
 
@@ -220,5 +264,6 @@ export class Database {
     this.checkpoint();
     this.wal.close();
     this.pager.close();
+    this.lock.release();
   }
 }

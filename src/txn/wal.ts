@@ -2,7 +2,6 @@ import {
   closeSync,
   existsSync,
   fstatSync,
-  fsyncSync,
   ftruncateSync,
   openSync,
   readSync,
@@ -21,6 +20,8 @@ import {
   WAL_UPDATE,
 } from "../constants.js";
 import { WalError } from "../errors.js";
+import { crc32 } from "../storage/crc32.js";
+import { Durability } from "../storage/durability.js";
 
 /** A decoded log record. Each carries a monotonically increasing LSN. */
 export type WalRecord =
@@ -52,23 +53,6 @@ export type WalRecordSpec =
   | { readonly type: "commit"; readonly txid: bigint }
   | { readonly type: "abort"; readonly txid: bigint }
   | { readonly type: "checkpoint"; readonly active: bigint[] };
-
-// ---- CRC32 (IEEE polynomial), so a torn trailing record is detectable -------
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32(buf: Buffer): number {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = (CRC_TABLE[(c ^ buf[i]!) & 0xff]! ^ (c >>> 8)) >>> 0;
-  return (c ^ 0xffffffff) >>> 0;
-}
 
 function encodePayload(spec: WalRecordSpec, lsn: bigint): Buffer {
   switch (spec.type) {
@@ -173,13 +157,14 @@ export class Wal {
     readonly path: string,
     private size: number,
     startLsn: bigint,
+    private readonly durability: Durability,
   ) {
     this.nextLsn = startLsn;
   }
 
-  static open(path: string, startLsn = 1n): Wal {
+  static open(path: string, durability: Durability = new Durability(), startLsn = 1n): Wal {
     const fd = openSync(path, existsSync(path) ? "r+" : "w+");
-    return new Wal(fd, path, fstatSync(fd).size, startLsn);
+    return new Wal(fd, path, fstatSync(fd).size, startLsn, durability);
   }
 
   /** LSN that will be assigned to the next appended record. */
@@ -205,15 +190,32 @@ export class Wal {
     return lsn;
   }
 
-  /** Write buffered records to disk and fsync. `upToLsn` is advisory — we always
-   *  flush everything pending, which trivially satisfies any lower bound. */
-  flush(_upToLsn?: bigint): void {
+  /** Write buffered records to disk (no fsync). */
+  private writePending(): void {
     if (this.pending.length === 0) return;
     const batch = this.pending.length === 1 ? this.pending[0]! : Buffer.concat(this.pending);
     writeSync(this.fd, batch, 0, batch.length, this.size);
     this.size += batch.length;
     this.pending = [];
-    fsyncSync(this.fd);
+  }
+
+  /**
+   * Flush with a hard durability barrier. Used for the write-ahead rule (before
+   * a dirty data page is written) and for checkpoints, both of which must be
+   * durable in every sync mode except `off`.
+   */
+  flush(): void {
+    this.writePending();
+    this.durability.barrier(this.fd, this.path);
+  }
+
+  /**
+   * Flush for a commit/abort. The barrier is relaxed under the `normal` sync
+   * mode (the records reach the OS but are not fsync'd until the next checkpoint).
+   */
+  flushForCommit(): void {
+    this.writePending();
+    this.durability.commitBarrier(this.fd, this.path);
   }
 
   /**
