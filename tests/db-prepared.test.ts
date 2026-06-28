@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { Database } from "../src/db.js";
-import { BindError } from "../src/errors.js";
+import { BindError, PlanError } from "../src/errors.js";
 import { makeTempDb, type TempDb } from "./helpers/tmp.js";
 
 describe("prepared statements and parameter binding", () => {
@@ -88,13 +88,14 @@ describe("prepared statements and parameter binding", () => {
     expect(db.prepare("SELECT id FROM users ORDER BY id").all()).toEqual([{ id: 1n }, { id: 2n }]);
   });
 
-  it("coerces an integer JS number to bigint but rejects a non-integer", () => {
+  it("coerces an integer JS number to bigint but rejects a non-integer for an INT column", () => {
     db.prepare("INSERT INTO users (id, name, active) VALUES (?, ?, ?)").run(7, "n", true);
     expect(db.prepare("SELECT id FROM users WHERE id = ?").pluck(7)).toBe(7n);
 
+    // 1.5 is a valid REAL but cannot be stored in an INT column.
     expect(() =>
       db.prepare("INSERT INTO users (id, name, active) VALUES (?, ?, ?)").run(1.5, "n", true),
-    ).toThrow(BindError);
+    ).toThrow(PlanError);
   });
 
   it("throws BindError when the parameter count does not match", () => {

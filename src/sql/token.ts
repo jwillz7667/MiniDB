@@ -3,7 +3,9 @@ export type TokenType =
   | "keyword"
   | "identifier"
   | "integer"
+  | "float"
   | "string"
+  | "blob" // X'48656c6c6f' hex literal; value is the hex digits
   | "operator" // = != < <= > >=
   | "punctuation" // ( ) , * ; - ?
   | "eof";
@@ -43,8 +45,11 @@ export const KEYWORDS: ReadonlySet<string> = new Set([
   "TRUE",
   "FALSE",
   "INT",
+  "REAL",
   "TEXT",
   "BOOL",
+  "BLOB",
+  "DATETIME",
   "EXPLAIN",
   "BEGIN",
   "COMMIT",

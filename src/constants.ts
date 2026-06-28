@@ -44,6 +44,9 @@ export const NODE_INTERNAL = 2;
 export const TYPE_INT = 1;
 export const TYPE_TEXT = 2;
 export const TYPE_BOOL = 3;
+export const TYPE_REAL = 4; // IEEE-754 double
+export const TYPE_BLOB = 5; // raw bytes
+export const TYPE_DATETIME = 6; // signed 64-bit epoch milliseconds, surfaced as a Date
 
 /** WAL record type tags. */
 export const WAL_BEGIN = 1;
