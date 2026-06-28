@@ -23,6 +23,13 @@ export interface Column {
   readonly name: string;
   readonly type: ColumnType;
   readonly nullable: boolean;
+  /** Part of the table's (single-column) PRIMARY KEY. Implies NOT NULL + UNIQUE. */
+  readonly primaryKey?: boolean;
+  readonly unique?: boolean;
+  /** INT column that auto-assigns the next id when an INSERT omits it. */
+  readonly autoIncrement?: boolean;
+  /** DEFAULT value applied when an INSERT omits this column. */
+  readonly default?: Value;
 }
 
 /** An ordered list of columns describing a row's shape. */

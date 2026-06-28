@@ -69,6 +69,7 @@ export interface PhysInsert {
   readonly table: TableMeta;
   readonly columns: Column[];
   readonly rows: Value[][];
+  readonly autoIncrement?: { columnIndex: number; indexRoot: number };
 }
 export interface PhysUpdate {
   readonly op: "Update";
@@ -123,7 +124,13 @@ export function toPhysical(plan: LogicalPlan, limitHint?: number): PhysicalPlan 
       return { op: "Limit", columns: input.columns, limit: plan.limit, input };
     }
     case "insert":
-      return { op: "Insert", table: plan.table, columns: plan.table.columns, rows: plan.rows };
+      return {
+        op: "Insert",
+        table: plan.table,
+        columns: plan.table.columns,
+        rows: plan.rows,
+        ...(plan.autoIncrement ? { autoIncrement: plan.autoIncrement } : {}),
+      };
     case "update": {
       const input = toPhysical(plan.input);
       return {

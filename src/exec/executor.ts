@@ -76,6 +76,10 @@ export class Executor {
       name: c.name,
       type: c.type,
       nullable: c.nullable,
+      primaryKey: c.primaryKey,
+      unique: c.unique,
+      autoIncrement: c.autoIncrement,
+      ...(c.default !== undefined ? { default: c.default } : {}),
     }));
     this.catalog.createTable(this.ctx.tx, stmt.table, columns);
     return { type: "createTable", table: stmt.table };

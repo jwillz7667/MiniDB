@@ -264,6 +264,7 @@ class InsertOp implements Operator {
     private readonly ctx: ExecContext,
     private readonly table: TableMeta,
     private readonly rows: Value[][],
+    private readonly autoIncrement: { columnIndex: number; indexRoot: number } | undefined,
   ) {
     this.columns = table.columns;
   }
@@ -274,7 +275,16 @@ class InsertOp implements Operator {
 
   next(): ExecTuple | null {
     if (this.pos >= this.rows.length) return null;
-    const values = this.rows[this.pos++]!;
+    let values = this.rows[this.pos++]!;
+    if (this.autoIncrement) {
+      const { columnIndex, indexRoot } = this.autoIncrement;
+      if (values[columnIndex] === null) {
+        // Next id = current max in the column's unique index + 1. Reading the
+        // index each time reflects rows inserted earlier in this same statement.
+        values = values.slice();
+        values[columnIndex] = (BTree.maxKey(this.ctx.tx, indexRoot) ?? 0n) + 1n;
+      }
+    }
     const rowid = this.ctx.rowids.allocate(this.ctx.tx, this.table);
     const rid = this.ctx.store.insertRow(this.ctx.tx, this.table, rowid, values);
     return { rowid, rid, values };
@@ -385,7 +395,7 @@ export function buildOperator(plan: PhysicalPlan, ctx: ExecContext): Operator {
     case "Limit":
       return new LimitOp(buildOperator(plan.input, ctx), plan.limit);
     case "Insert":
-      return new InsertOp(ctx, plan.table, plan.rows);
+      return new InsertOp(ctx, plan.table, plan.rows, plan.autoIncrement);
     case "Update":
       return new UpdateOp(ctx, plan.table, buildOperator(plan.input, ctx), plan.assignments);
     case "Delete":

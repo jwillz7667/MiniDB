@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { ParseError } from "../../src/errors.js";
 import type {
+  ColumnDef,
   CreateTableStmt,
   DeleteStmt,
   InsertStmt,
@@ -9,9 +10,20 @@ import type {
   LiteralValue,
   SelectStmt,
 } from "../../src/sql/ast.js";
+import type { ColumnType } from "../../src/record/schema.js";
 import { parse } from "../../src/sql/parser.js";
 
 const lit = (value: LiteralValue): LiteralExpr => ({ kind: "literal", value });
+
+const coldef = (name: string, type: ColumnType, nullable: boolean): ColumnDef => ({
+  name,
+  type,
+  nullable,
+  primaryKey: false,
+  unique: false,
+  autoIncrement: false,
+  default: undefined,
+});
 
 describe("parser", () => {
   it("parses CREATE TABLE with types and NOT NULL", () => {
@@ -21,9 +33,20 @@ describe("parser", () => {
     expect(stmt.kind).toBe("createTable");
     expect(stmt.table).toBe("users");
     expect(stmt.columns).toEqual([
-      { name: "id", type: "INT", nullable: false },
-      { name: "name", type: "TEXT", nullable: true },
-      { name: "active", type: "BOOL", nullable: false },
+      coldef("id", "INT", false),
+      coldef("name", "TEXT", true),
+      coldef("active", "BOOL", false),
+    ]);
+  });
+
+  it("parses column constraints (PRIMARY KEY / UNIQUE / AUTOINCREMENT / DEFAULT)", () => {
+    const stmt = parse(
+      "CREATE TABLE t (id INT PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, n INT DEFAULT 7)",
+    ) as CreateTableStmt;
+    expect(stmt.columns).toEqual([
+      { ...coldef("id", "INT", false), primaryKey: true, autoIncrement: true },
+      { ...coldef("email", "TEXT", true), unique: true },
+      { ...coldef("n", "INT", true), default: 7n },
     ]);
   });
 

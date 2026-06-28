@@ -9,10 +9,19 @@ import { Pager } from "../../src/storage/pager.js";
 import { DirectTx } from "../../src/storage/tx.js";
 import { makeStorage, type StorageStack } from "../helpers/storage.js";
 
+const col = (name: string, type: Column["type"], nullable: boolean): Column => ({
+  name,
+  type,
+  nullable,
+  primaryKey: false,
+  unique: false,
+  autoIncrement: false,
+});
+
 const userColumns: Column[] = [
-  { name: "id", type: "INT", nullable: false },
-  { name: "email", type: "TEXT", nullable: false },
-  { name: "verified", type: "BOOL", nullable: true },
+  col("id", "INT", false),
+  col("email", "TEXT", false),
+  col("verified", "BOOL", true),
 ];
 
 describe("Catalog", () => {
@@ -87,7 +96,7 @@ describe("Catalog", () => {
     const pool = new BufferPool(pager, 64);
     const reopened = Catalog.open(new DirectTx(pool), pager, new Heap());
     expect(reopened.getIndexes("users")).toEqual([
-      { tableName: "users", columnName: "id", root: 7 },
+      { tableName: "users", columnName: "id", root: 7, unique: false },
     ]);
     pager.close();
   });

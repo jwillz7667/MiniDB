@@ -65,6 +65,9 @@ export class PlanError extends MiniDBError {}
 /** Execution failed: type mismatch in a predicate, write conflict, etc. */
 export class ExecutionError extends MiniDBError {}
 
+/** A constraint was violated: UNIQUE/PRIMARY KEY duplicate, etc. */
+export class ConstraintError extends MiniDBError {}
+
 /** The write-ahead log or recovery encountered an unrecoverable condition. */
 export class WalError extends MiniDBError {}
 

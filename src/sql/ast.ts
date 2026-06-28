@@ -55,6 +55,11 @@ export interface ColumnDef {
   readonly name: string;
   readonly type: ColumnType;
   readonly nullable: boolean;
+  readonly primaryKey: boolean;
+  readonly unique: boolean;
+  readonly autoIncrement: boolean;
+  /** DEFAULT literal value, or undefined if none was declared. */
+  readonly default: LiteralValue | undefined;
 }
 
 /** Top-level statements. */
