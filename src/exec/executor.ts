@@ -15,11 +15,16 @@ import { buildDelete, buildInsert, buildSelect, type LogicalPlan } from "../plan
 import { optimize } from "../plan/optimizer.js";
 import { explain, toPhysical } from "../plan/physical.js";
 import type { ExecContext } from "./context.js";
-import { buildOperator, type Operator } from "./operators.js";
+import { buildOperator, type ExecTuple, type Operator } from "./operators.js";
 
 export type QueryResult =
   | { readonly type: "select"; readonly columns: string[]; readonly rows: Value[][] }
-  | { readonly type: "insert"; readonly rowCount: number }
+  | {
+      readonly type: "insert";
+      readonly rowCount: number;
+      /** Internal rowid of the last row inserted, or null if none were. */
+      readonly lastInsertRowid: bigint | null;
+    }
   | { readonly type: "delete"; readonly rowCount: number }
   | { readonly type: "createTable"; readonly table: string }
   | { readonly type: "createIndex"; readonly table: string; readonly column: string }
@@ -93,7 +98,13 @@ export class Executor {
 
   private insert(stmt: InsertStmt): QueryResult {
     const plan = toPhysical(buildInsert(stmt, this.catalog));
-    return { type: "insert", rowCount: this.drain(buildOperator(plan, this.ctx)).length };
+    const inserted = this.drainTuples(buildOperator(plan, this.ctx));
+    const last = inserted.at(-1);
+    return {
+      type: "insert",
+      rowCount: inserted.length,
+      lastInsertRowid: last ? last.rowid : null,
+    };
   }
 
   private delete(stmt: DeleteStmt): QueryResult {
@@ -112,7 +123,12 @@ export class Executor {
 
   /** Pull an operator to exhaustion, collecting its tuples. */
   private drain(op: Operator): { values: Value[] }[] {
-    const out: { values: Value[] }[] = [];
+    return this.drainTuples(op);
+  }
+
+  /** Like `drain`, but preserves the full tuple (rowid/rid) for callers that need it. */
+  private drainTuples(op: Operator): ExecTuple[] {
+    const out: ExecTuple[] = [];
     op.open();
     try {
       for (let t = op.next(); t !== null; t = op.next()) out.push(t);

@@ -56,6 +56,9 @@ export class ParseError extends MiniDBError {
   }
 }
 
+/** Binding parameters to a prepared statement failed (count/type mismatch). */
+export class BindError extends MiniDBError {}
+
 /** Planning failed: query references something that cannot be resolved/optimized. */
 export class PlanError extends MiniDBError {}
 

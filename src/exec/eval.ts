@@ -48,6 +48,10 @@ export function compileExpr(expr: Expr, columns: Column[]): CompiledExpr {
       const v = expr.value;
       return () => v;
     }
+    case "param":
+      // Binding replaces every placeholder before planning; reaching here means
+      // a statement was run without being bound.
+      throw new ExecutionError(`unbound parameter ?${expr.index + 1} (use a prepared statement)`);
     case "column": {
       const idx = resolveColumn(columns, expr.name);
       return (values) => values[idx]!;

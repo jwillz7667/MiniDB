@@ -8,12 +8,25 @@ export type LogicalOp = "AND" | "OR";
 export type SortDir = "ASC" | "DESC";
 
 /** WHERE-clause expression tree. */
-export type Expr = LiteralExpr | ColumnExpr | CompareExpr | LogicalExpr;
+export type Expr = LiteralExpr | ParamExpr | ColumnExpr | CompareExpr | LogicalExpr;
 
 export interface LiteralExpr {
   readonly kind: "literal";
   readonly value: LiteralValue;
 }
+
+/**
+ * A positional bind placeholder (`?`). Produced by the parser and resolved to a
+ * LiteralExpr by `bindStatement` before planning — no param node ever reaches
+ * the optimizer or executor.
+ */
+export interface ParamExpr {
+  readonly kind: "param";
+  readonly index: number;
+}
+
+/** A value position that may be a literal or a placeholder (INSERT/UPDATE). */
+export type ValueExpr = LiteralExpr | ParamExpr;
 
 export interface ColumnExpr {
   readonly kind: "column";
@@ -67,7 +80,8 @@ export interface InsertStmt {
   readonly table: string;
   /** Target columns, or null to mean "all columns in declared order". */
   readonly columns: string[] | null;
-  readonly rows: LiteralValue[][];
+  /** One entry per value; literals or `?` placeholders (resolved by binding). */
+  readonly rows: ValueExpr[][];
 }
 
 export interface OrderBy {

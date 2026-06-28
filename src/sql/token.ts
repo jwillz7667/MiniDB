@@ -5,7 +5,7 @@ export type TokenType =
   | "integer"
   | "string"
   | "operator" // = != < <= > >=
-  | "punctuation" // ( ) , * ; -
+  | "punctuation" // ( ) , * ; - ?
   | "eof";
 
 export interface Token {

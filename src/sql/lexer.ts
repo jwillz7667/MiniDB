@@ -127,8 +127,8 @@ export function tokenize(source: string): Token[] {
       continue;
     }
 
-    // Punctuation.
-    if (c === "(" || c === ")" || c === "," || c === "*" || c === ";" || c === "-") {
+    // Punctuation. "?" is a positional bind placeholder.
+    if (c === "(" || c === ")" || c === "," || c === "*" || c === ";" || c === "-" || c === "?") {
       advance();
       push("punctuation", c);
       continue;

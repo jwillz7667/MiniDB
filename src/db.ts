@@ -10,8 +10,10 @@ import { Heap } from "./storage/heap.js";
 import { FileLock } from "./storage/lock.js";
 import { Pager } from "./storage/pager.js";
 import { DirectTx } from "./storage/tx.js";
-import { parse, parseMany } from "./sql/parser.js";
+import { parseMany, parsePrepared } from "./sql/parser.js";
+import { bindStatement, type BindValue } from "./sql/bind.js";
 import type { Statement } from "./sql/ast.js";
+import { PreparedStatement, type Row, type RunResult } from "./statement.js";
 import { recover, type RecoveryStats } from "./txn/recovery.js";
 import { WalTx } from "./txn/wal-tx.js";
 import { Wal } from "./txn/wal.js";
@@ -129,17 +131,42 @@ export class Database {
     }
   }
 
-  /** Execute one SQL statement. */
-  exec(sql: string): ExecResult {
-    return this.run(parse(sql));
+  /**
+   * Execute one SQL statement, optionally binding `?` placeholders. Passing user
+   * input via `params` is the injection-safe path — values are bound, never
+   * spliced into SQL text.
+   */
+  exec(sql: string, params: readonly BindValue[] = []): ExecResult {
+    const { statement, paramCount } = parsePrepared(sql);
+    return this.dispatch(bindStatement(statement, params, paramCount));
   }
 
   /** Execute several `;`-separated statements, returning each result. */
   execMany(sql: string): ExecResult[] {
-    return parseMany(sql).map((stmt) => this.run(stmt));
+    return parseMany(sql).map((stmt) => this.dispatch(stmt));
   }
 
-  private run(stmt: Statement): ExecResult {
+  /**
+   * Parse a statement once and return a reusable, parameterized handle. The
+   * returned object's `all`/`get`/`values`/`pluck`/`run` methods bind values to
+   * `?` placeholders safely — the recommended way to pass any external input.
+   */
+  prepare(sql: string): PreparedStatement {
+    const { statement, paramCount } = parsePrepared(sql);
+    return new PreparedStatement(sql, statement, paramCount, (stmt) => this.dispatch(stmt));
+  }
+
+  /** One-shot query: prepare, bind, and return rows as objects keyed by column. */
+  query(sql: string, params: readonly BindValue[] = []): Row[] {
+    return this.prepare(sql).all(params);
+  }
+
+  /** One-shot mutation: prepare, bind, and report rows changed + last rowid. */
+  run(sql: string, params: readonly BindValue[] = []): RunResult {
+    return this.prepare(sql).run(params);
+  }
+
+  private dispatch(stmt: Statement): ExecResult {
     if (stmt.kind === "begin" || stmt.kind === "commit" || stmt.kind === "rollback") {
       return this.control(stmt.kind);
     }
