@@ -42,7 +42,12 @@ export class DirectTx implements Tx {
 
   modify(pageNo: number, mutator: (page: Buffer) => void): void {
     const page = this.pool.fetchPage(pageNo);
-    mutator(page);
-    this.pool.unpin(pageNo, true);
+    // A mutator can throw (e.g. an oversized record); release the pin regardless,
+    // mirroring WalTx.modify, so a failed write never leaks a frame.
+    try {
+      mutator(page);
+    } finally {
+      this.pool.unpin(pageNo, true);
+    }
   }
 }

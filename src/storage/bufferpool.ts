@@ -157,16 +157,18 @@ export class BufferPool {
     this.flushFrame(this.frames[idx]!);
   }
 
-  /** Write every dirty page back and fsync the data file. */
+  /**
+   * Write every dirty page back and fsync the data file. The fsync is
+   * unconditional: pages written earlier during eviction go through
+   * `pager.writePage(..., sync=false)`, so they may still sit unforced in the OS
+   * cache even when no frame is currently dirty. A checkpoint relies on this to
+   * force ALL outstanding page writes before its checkpoint record is logged.
+   */
   flushAll(): void {
-    let any = false;
     for (const frame of this.frames) {
-      if (frame.dirty && frame.pageNo !== -1) {
-        this.flushFrame(frame);
-        any = true;
-      }
+      if (frame.dirty && frame.pageNo !== -1) this.flushFrame(frame);
     }
-    if (any) this.pager.sync();
+    this.pager.sync();
   }
 
   /**
