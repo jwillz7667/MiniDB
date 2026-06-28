@@ -11,9 +11,20 @@ export default defineConfig({
     testTimeout: 30_000,
     coverage: {
       provider: "v8",
-      reporter: ["text", "html"],
+      reporter: ["text", "text-summary", "html"],
       include: ["src/**/*.ts"],
-      exclude: ["src/repl.ts", "src/bench/**", "src/**/*.test.ts"],
+      exclude: [
+        "src/repl.ts", // interactive entrypoint, exercised by hand
+        "src/bench/**",
+        "src/sql/ast.ts", // type-only declarations, no runtime code
+        "src/**/*.test.ts",
+      ],
+      thresholds: {
+        statements: 90,
+        branches: 82,
+        functions: 90,
+        lines: 90,
+      },
     },
   },
 });

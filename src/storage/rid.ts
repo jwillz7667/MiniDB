@@ -7,7 +7,3 @@ export interface Rid {
   readonly pageNo: number;
   readonly slot: number;
 }
-
-export function ridEquals(a: Rid, b: Rid): boolean {
-  return a.pageNo === b.pageNo && a.slot === b.slot;
-}
