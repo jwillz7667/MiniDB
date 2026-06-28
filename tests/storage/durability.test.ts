@@ -49,12 +49,12 @@ describe("durability modes", () => {
     });
 
     const off = new Durability("off");
-    off.barrier(-1);
-    off.commitBarrier(-1);
+    off.barrier(-1, "x");
+    off.commitBarrier(-1, "x");
     expect(hookCalls).toBe(0); // no real fsync attempted, so the hook never runs
 
     // 'full' runs the hook, then fsync(-1) fails with EBADF — we only assert the hook ran.
-    expect(() => new Durability("full").barrier(-1)).toThrow();
+    expect(() => new Durability("full").barrier(-1, "x")).toThrow();
     expect(hookCalls).toBe(1);
   });
 });

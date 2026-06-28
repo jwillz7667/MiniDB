@@ -18,43 +18,55 @@ import { dirname } from "node:path";
  */
 export type SyncMode = "full" | "normal" | "off";
 
-// Test-only seam: a fault hook invoked immediately before each real fsync, so a
-// crash-injection harness can simulate power loss at a precise durability point.
-let faultHook: (() => void) | null = null;
+// Test-only seam: a fault hook invoked immediately before each real fsync (with
+// the path being synced), so a crash-injection harness can both snapshot the
+// last durable image of a file and simulate power loss at a precise point.
+let faultHook: ((path: string) => void) | null = null;
 
 /** Install (or clear) the fsync fault hook. Intended for tests only. */
-export function setSyncFault(hook: (() => void) | null): void {
+export function setSyncFault(hook: ((path: string) => void) | null): void {
   faultHook = hook;
 }
+
+/** errno codes for platforms/filesystems that reject fsync on a directory handle. */
+const DIR_FSYNC_UNSUPPORTED = new Set(["EISDIR", "EINVAL", "EPERM", "EACCES", "EBADF"]);
 
 export class Durability {
   constructor(readonly mode: SyncMode = "full") {}
 
   /** Hard durability barrier: write-ahead ordering and checkpoints depend on it. */
-  barrier(fd: number): void {
+  barrier(fd: number, path: string): void {
     if (this.mode === "off") return;
-    faultHook?.();
+    faultHook?.(path);
     fsyncSync(fd);
   }
 
   /** Commit durability. Relaxed under `normal`, where it is deferred to the next barrier. */
-  commitBarrier(fd: number): void {
+  commitBarrier(fd: number, path: string): void {
     if (this.mode !== "full") return;
-    faultHook?.();
+    faultHook?.(path);
     fsyncSync(fd);
   }
 
-  /** Make a freshly created file's directory entry durable (best-effort per platform). */
+  /** Make a freshly created file's directory entry durable. */
   syncDir(filePath: string): void {
     if (this.mode === "off") return;
-    let dirFd: number | undefined;
+    const dir = dirname(filePath);
+    let dirFd: number;
     try {
-      dirFd = openSync(dirname(filePath), "r");
+      dirFd = openSync(dir, "r");
+    } catch (err) {
+      if (DIR_FSYNC_UNSUPPORTED.has((err as NodeJS.ErrnoException).code ?? "")) return;
+      throw err;
+    }
+    try {
+      faultHook?.(dir); // crash injection also covers the directory fsync
       fsyncSync(dirFd);
-    } catch {
-      // Some platforms (notably Windows) reject fsync on a directory handle.
+    } catch (err) {
+      // Only swallow platform rejections; a real EIO/ENOSPC must surface.
+      if (!DIR_FSYNC_UNSUPPORTED.has((err as NodeJS.ErrnoException).code ?? "")) throw err;
     } finally {
-      if (dirFd !== undefined) closeSync(dirFd);
+      closeSync(dirFd);
     }
   }
 }

@@ -63,7 +63,7 @@ export class Pager {
       header.writeBigUInt64LE(1n, HEADER_NEXT_TXID_OFFSET); // txids start at 1
       stampChecksum(header);
       writeSync(fd, header, 0, PAGE_SIZE, 0);
-      durability.barrier(fd);
+      durability.barrier(fd, path);
       durability.syncDir(path); // make the new file's directory entry durable
       return new Pager(fd, path, header, 1, durability);
     }
@@ -170,7 +170,7 @@ export class Pager {
     if (written !== PAGE_SIZE) {
       throw new PageError(`short write on page ${pageNo}: ${written}/${PAGE_SIZE} bytes`);
     }
-    if (sync) this.durability.barrier(this.fd);
+    if (sync) this.durability.barrier(this.fd, this.path);
   }
 
   /** Grow the file by one zero-filled page and return its page number. */
@@ -199,7 +199,7 @@ export class Pager {
   private writeHeader(): void {
     stampChecksum(this.header);
     writeSync(this.fd, this.header, 0, PAGE_SIZE, 0);
-    this.durability.barrier(this.fd);
+    this.durability.barrier(this.fd, this.path);
   }
 
   /** Heap root page of the catalog (minidb_tables), or INVALID_PAGE if unset. */
@@ -227,7 +227,7 @@ export class Pager {
     // Keep the persisted page count current before forcing the file down.
     stampChecksum(this.header);
     writeSync(this.fd, this.header, 0, PAGE_SIZE, 0);
-    this.durability.barrier(this.fd);
+    this.durability.barrier(this.fd, this.path);
   }
 
   close(): void {

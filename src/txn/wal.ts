@@ -206,7 +206,7 @@ export class Wal {
    */
   flush(): void {
     this.writePending();
-    this.durability.barrier(this.fd);
+    this.durability.barrier(this.fd, this.path);
   }
 
   /**
@@ -215,7 +215,7 @@ export class Wal {
    */
   flushForCommit(): void {
     this.writePending();
-    this.durability.commitBarrier(this.fd);
+    this.durability.commitBarrier(this.fd, this.path);
   }
 
   /**
