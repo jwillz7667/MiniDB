@@ -1,4 +1,4 @@
-import { U16, U64 } from "../constants.js";
+import { U32, U64 } from "../constants.js";
 import { TupleError } from "../errors.js";
 import type { Row, Schema, Value } from "./schema.js";
 import { coerceToColumnType } from "./value.js";
@@ -9,10 +9,13 @@ import { coerceToColumnType } from "./value.js";
  * packed by type:
  *   INT      → 8-byte little-endian signed integer (bigint)
  *   REAL     → 8-byte little-endian IEEE-754 double
- *   TEXT     → u16 byte length, then UTF-8 bytes
+ *   TEXT     → u32 byte length, then UTF-8 bytes
  *   BOOL     → 1 byte (0 or 1)
- *   BLOB     → u16 byte length, then raw bytes
+ *   BLOB     → u32 byte length, then raw bytes
  *   DATETIME → 8-byte little-endian signed integer (epoch milliseconds)
+ *
+ * TEXT/BLOB use a u32 length so a single value can exceed one page; the table
+ * store spills any tuple larger than a heap page to an overflow chain.
  */
 
 function bitmapBytes(columnCount: number): number {
@@ -66,21 +69,15 @@ export function serialize(schema: Schema, row: Row): Buffer {
       }
       case "TEXT": {
         const utf8 = Buffer.from(v as string, "utf8");
-        if (utf8.length > 0xffff) {
-          throw new TupleError(`TEXT value for "${col.name}" exceeds ${0xffff} bytes`);
-        }
-        const len = Buffer.alloc(U16);
-        len.writeUInt16LE(utf8.length);
+        const len = Buffer.alloc(U32);
+        len.writeUInt32LE(utf8.length);
         parts.push(len, utf8);
         break;
       }
       case "BLOB": {
         const bytes = v as Buffer;
-        if (bytes.length > 0xffff) {
-          throw new TupleError(`BLOB value for "${col.name}" exceeds ${0xffff} bytes`);
-        }
-        const len = Buffer.alloc(U16);
-        len.writeUInt16LE(bytes.length);
+        const len = Buffer.alloc(U32);
+        len.writeUInt32LE(bytes.length);
         parts.push(len, bytes);
         break;
       }
@@ -132,18 +129,18 @@ export function deserialize(schema: Schema, buf: Buffer): Row {
         break;
       }
       case "TEXT": {
-        if (offset + U16 > buf.length) throw new TupleError(`truncated TEXT length for "${col.name}"`);
-        const len = buf.readUInt16LE(offset);
-        offset += U16;
+        if (offset + U32 > buf.length) throw new TupleError(`truncated TEXT length for "${col.name}"`);
+        const len = buf.readUInt32LE(offset);
+        offset += U32;
         if (offset + len > buf.length) throw new TupleError(`truncated TEXT body for "${col.name}"`);
         row[i] = buf.toString("utf8", offset, offset + len);
         offset += len;
         break;
       }
       case "BLOB": {
-        if (offset + U16 > buf.length) throw new TupleError(`truncated BLOB length for "${col.name}"`);
-        const len = buf.readUInt16LE(offset);
-        offset += U16;
+        if (offset + U32 > buf.length) throw new TupleError(`truncated BLOB length for "${col.name}"`);
+        const len = buf.readUInt32LE(offset);
+        offset += U32;
         if (offset + len > buf.length) throw new TupleError(`truncated BLOB body for "${col.name}"`);
         row[i] = Buffer.from(buf.subarray(offset, offset + len));
         offset += len;
