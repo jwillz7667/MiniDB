@@ -65,5 +65,8 @@ export class ExecutionError extends MiniDBError {}
 /** The write-ahead log or recovery encountered an unrecoverable condition. */
 export class WalError extends MiniDBError {}
 
+/** The database file is already open elsewhere (another live process/instance). */
+export class LockError extends MiniDBError {}
+
 /** A transaction was used illegally (e.g. after commit) or hit an MVCC conflict. */
 export class TransactionError extends MiniDBError {}

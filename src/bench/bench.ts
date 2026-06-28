@@ -108,6 +108,7 @@ function benchRecovery(): void {
     }
     const walMb = statSync(`${path}-wal`).size / (1024 * 1024);
     // "Crash": abandon db without closing, then reopen to recover.
+    rmSync(`${path}-lock`, { force: true }); // the crashed process's lock is now stale
 
     const start = process.hrtime.bigint();
     const recovered = Database.open(path, { poolSize: 256 });

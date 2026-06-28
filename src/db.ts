@@ -7,6 +7,7 @@ import { Catalog, type TableMeta } from "./record/catalog.js";
 import { BufferPool } from "./storage/bufferpool.js";
 import { Durability, type SyncMode } from "./storage/durability.js";
 import { Heap } from "./storage/heap.js";
+import { FileLock } from "./storage/lock.js";
 import { Pager } from "./storage/pager.js";
 import { DirectTx } from "./storage/tx.js";
 import { parse, parseMany } from "./sql/parser.js";
@@ -50,6 +51,7 @@ export class Database {
     private readonly heap: Heap,
     private readonly rowids: RowIdAllocator,
     private readonly readTx: DirectTx,
+    private readonly lock: FileLock,
     recovery: RecoveryStats,
   ) {
     this.lastRecovery = recovery;
@@ -58,6 +60,17 @@ export class Database {
   }
 
   static open(path: string, options: DatabaseOptions = {}): Database {
+    // Refuse to open a file another live instance holds (would corrupt it).
+    const lock = FileLock.acquire(path);
+    try {
+      return Database.openLocked(path, options, lock);
+    } catch (err) {
+      lock.release();
+      throw err;
+    }
+  }
+
+  private static openLocked(path: string, options: DatabaseOptions, lock: FileLock): Database {
     const durability = new Durability(options.synchronous ?? "full");
     const pager = Pager.open(path, durability);
     const wal = Wal.open(`${path}-wal`, durability);
@@ -88,7 +101,18 @@ export class Database {
 
     const store = new TableStore(catalog, heap);
     const rowids = new RowIdAllocator();
-    return new Database(pager, pool, wal, catalog, store, heap, rowids, new DirectTx(pool), recovery);
+    return new Database(
+      pager,
+      pool,
+      wal,
+      catalog,
+      store,
+      heap,
+      rowids,
+      new DirectTx(pool),
+      lock,
+      recovery,
+    );
   }
 
   /** Execute one SQL statement. */
@@ -224,5 +248,6 @@ export class Database {
     this.checkpoint();
     this.wal.close();
     this.pager.close();
+    this.lock.release();
   }
 }

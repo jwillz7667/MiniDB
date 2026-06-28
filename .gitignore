@@ -6,6 +6,7 @@ coverage/
 # Local scratch databases produced by demos / manual runs
 *.minidb
 *.minidb-wal
+*.minidb-lock
 /.scratch/
 /tmp/
 
