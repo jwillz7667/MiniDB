@@ -70,11 +70,14 @@ pool depends on pager. **This order is load-bearing — do not reorder phases.**
   durable up to that page's `pageLSN` (tracked per frame). `WalTx` sets `pageLSN` on every
   logged mutation. Commit fsyncs the WAL through the COMMIT record.
 - **Recovery is physical redo/undo (ARIES-lite, STEAL + NO-FORCE).** Redo re-applies every
-  logged after-image (committed or not, idempotent); undo walks the full log backward
-  applying before-images for "loser" (uncommitted) transactions. UPDATE records that
-  reference a page beyond the current file size grow the file — this makes page
-  *allocation* durable for free. Recovery exposes stats (`redoStartLsn`, counts) so the
-  checkpoint optimization is testable.
+  logged after-image from the last checkpoint forward (idempotent). Undo reverts
+  before-images for *true in-flight losers only* — transactions with neither a COMMIT nor an
+  ABORT record. Rollback logs **compensation records (CLRs)**, so an aborted transaction is
+  reverted by redo replaying its CLRs, never by the undo pass (undoing an aborted
+  transaction's before-images would clobber a value a later committed transaction wrote to
+  the same bytes). UPDATE records past EOF grow the file — page *allocation* is durable for
+  free. Recovery exposes stats (`redoStartLsn`, counts) so the checkpoint optimization is
+  testable.
 - **Each WAL record carries a CRC32.** Replay stops at the first record with a bad/short
   checksum — that is the crash point. This is how torn trailing writes are tolerated.
 - **Tombstone deletes only** (B+Tree entries and heap slots). No merge/rebalance, no page

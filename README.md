@@ -150,17 +150,19 @@ the WAL has been fsync'd up to that page's `pageLSN`. That single hook lets the 
 **STEAL** (evict uncommitted pages to make room) and **NO-FORCE** (don't flush on commit) — the
 policies that make it fast — while staying recoverable.
 
-Recovery is ARIES-lite: **analysis** finds committed transactions and the last checkpoint,
-**redo** re-applies every logged after-image from the checkpoint forward (rebuilding pages
-no-force left only in the log), and **undo** walks the log backward reverting before-images for
-transactions that never committed (cleaning up what steal flushed prematurely). Page
-*allocation* is durable for free: a logged change to a page past end-of-file grows the file
-first. Log records carry a CRC32, so a torn trailing write from a real crash is simply ignored.
+Recovery is ARIES-lite: **analysis** finds committed and aborted transactions and the last
+checkpoint, **redo** re-applies every logged after-image from the checkpoint forward
+(rebuilding pages no-force left only in the log), and **undo** reverts before-images for *true
+in-flight losers* — transactions with neither a COMMIT nor an ABORT. Rollback is itself logged:
+it writes **compensation records** so redo reconstructs the rolled-back state, which means an
+aborted transaction is never undone by the undo pass — undoing it would clobber whatever a
+*later committed* transaction wrote to the same bytes (a subtle corruption an adversarial code
+review caught and that the regression suite now guards). Page *allocation* is durable for free:
+a logged change to a page past end-of-file grows the file first. Log records carry a CRC32, so a
+torn trailing write from a real crash is simply ignored.
 
 The engine is **single-writer** (like SQLite's WAL mode): at most one transaction mutates at a
-time. That is precisely what makes the physical undo correct — the only "loser" after a crash
-is the final in-flight transaction, so no committed write can ever sit on top of one being
-undone.
+time, so the only true in-flight loser after a crash is the final, unfinished transaction.
 
 ### 3. MVCC visibility rules
 
