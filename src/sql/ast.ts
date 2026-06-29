@@ -78,6 +78,9 @@ export interface ColumnDef {
 export type Statement =
   | CreateTableStmt
   | CreateIndexStmt
+  | DropTableStmt
+  | DropIndexStmt
+  | AlterTableStmt
   | InsertStmt
   | SelectStmt
   | UpdateStmt
@@ -96,6 +99,25 @@ export interface CreateIndexStmt {
   readonly kind: "createIndex";
   readonly table: string;
   readonly column: string;
+}
+
+export interface DropTableStmt {
+  readonly kind: "dropTable";
+  readonly table: string;
+  readonly ifExists: boolean;
+}
+
+export interface DropIndexStmt {
+  readonly kind: "dropIndex";
+  readonly table: string;
+  readonly column: string;
+}
+
+export interface AlterTableStmt {
+  readonly kind: "alterTable";
+  readonly table: string;
+  /** The column to add (ALTER TABLE … ADD COLUMN). */
+  readonly column: ColumnDef;
 }
 
 export interface InsertStmt {
