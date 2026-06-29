@@ -30,8 +30,17 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@vitest/coverage-v8": "^2.1.8",
+    "kysely": "^0.29.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
+  },
+  "peerDependencies": {
+    "kysely": "^0.27 || ^0.28 || ^0.29"
+  },
+  "peerDependenciesMeta": {
+    "kysely": {
+      "optional": true
+    }
   }
 }

@@ -198,8 +198,20 @@ function buildSimpleSelect(stmt: SelectStmt, input: LogicalPlan): LogicalPlan {
     stmt.columns === "*" ? "*" : stmt.columns.map((item) => simpleProjectItem(item));
   plan = { kind: "project", columns, input: plan };
 
-  if (stmt.limit !== null) plan = { kind: "limit", limit: stmt.limit, input: plan };
+  const limit = limitValue(stmt.limit);
+  if (limit !== null) plan = { kind: "limit", limit, input: plan };
   return plan;
+}
+
+/** Resolve a (bound) LIMIT value expression to a non-negative integer. */
+function limitValue(limit: SelectStmt["limit"]): number | null {
+  if (limit === null) return null;
+  if (limit.kind !== "literal") throw new PlanError("LIMIT must be a constant (use a prepared statement)");
+  const v = limit.value;
+  if (typeof v !== "bigint" && typeof v !== "number") throw new PlanError("LIMIT must be an integer");
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0) throw new PlanError("LIMIT must be a non-negative integer");
+  return n;
 }
 
 function buildAggregateSelect(stmt: SelectStmt, input: LogicalPlan): LogicalPlan {
@@ -233,7 +245,8 @@ function buildAggregateSelect(stmt: SelectStmt, input: LogicalPlan): LogicalPlan
   // For aggregate queries, sort the projected output (so ORDER BY can use an
   // aggregate's alias); a group column must be selected to be ordered by.
   if (stmt.orderBy) plan = { kind: "sort", column: stmt.orderBy.column, dir: stmt.orderBy.dir, input: plan };
-  if (stmt.limit !== null) plan = { kind: "limit", limit: stmt.limit, input: plan };
+  const limit = limitValue(stmt.limit);
+  if (limit !== null) plan = { kind: "limit", limit, input: plan };
   return plan;
 }
 

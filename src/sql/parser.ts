@@ -361,9 +361,11 @@ class Parser {
       orderBy = { column, dir };
     }
 
-    let limit: number | null = null;
+    let limit: ValueExpr | null = null;
     if (this.matchKeyword("LIMIT")) {
-      limit = this.parseNonNegativeInteger();
+      limit = this.check("punctuation", "?")
+        ? (this.advance(), { kind: "param", index: this.params++ })
+        : { kind: "literal", value: BigInt(this.parseNonNegativeInteger()) };
     }
 
     return { kind: "select", columns, from, where, groupBy, having, orderBy, limit };

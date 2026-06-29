@@ -85,12 +85,17 @@ function rewriteSelect(stmt: SelectStmt, params: readonly LiteralValue[]): Selec
     stmt.columns === "*"
       ? "*"
       : stmt.columns.map((item) => ({ ...item, expr: bindExpr(item.expr, params) }));
+  const limit =
+    stmt.limit === null || stmt.limit.kind === "literal"
+      ? stmt.limit
+      : ({ kind: "literal", value: params[stmt.limit.index]! } as const);
   return {
     ...stmt,
     columns,
     from: { ...stmt.from, joins },
     where: stmt.where === null ? null : bindExpr(stmt.where, params),
     having: stmt.having === null ? null : bindExpr(stmt.having, params),
+    limit,
   };
 }
 

@@ -174,7 +174,8 @@ export interface SelectStmt {
   readonly groupBy: ColumnRef[] | null;
   readonly having: Expr | null;
   readonly orderBy: OrderBy | null;
-  readonly limit: number | null;
+  /** LIMIT count: an integer literal or a `?` placeholder (resolved at bind). */
+  readonly limit: ValueExpr | null;
 }
 
 export interface DeleteStmt {
