@@ -1,14 +1,4 @@
 import {
-  closeSync,
-  existsSync,
-  fstatSync,
-  ftruncateSync,
-  openSync,
-  readSync,
-  writeSync,
-} from "node:fs";
-
-import {
   U16,
   U32,
   U64,
@@ -22,6 +12,7 @@ import {
 import { WalError } from "../errors.js";
 import { crc32 } from "../storage/crc32.js";
 import { Durability } from "../storage/durability.js";
+import type { VfsFile } from "../storage/vfs.js";
 
 /** A decoded log record. Each carries a monotonically increasing LSN. */
 export type WalRecord =
@@ -153,7 +144,7 @@ export class Wal {
   private nextLsn: bigint;
 
   private constructor(
-    private readonly fd: number,
+    private readonly file: VfsFile,
     readonly path: string,
     private size: number,
     startLsn: bigint,
@@ -163,8 +154,8 @@ export class Wal {
   }
 
   static open(path: string, durability: Durability = new Durability(), startLsn = 1n): Wal {
-    const fd = openSync(path, existsSync(path) ? "r+" : "w+");
-    return new Wal(fd, path, fstatSync(fd).size, startLsn, durability);
+    const file = durability.vfs.open(path);
+    return new Wal(file, path, file.size(), startLsn, durability);
   }
 
   /** LSN that will be assigned to the next appended record. */
@@ -194,7 +185,7 @@ export class Wal {
   private writePending(): void {
     if (this.pending.length === 0) return;
     const batch = this.pending.length === 1 ? this.pending[0]! : Buffer.concat(this.pending);
-    writeSync(this.fd, batch, 0, batch.length, this.size);
+    this.file.writeAt(batch, this.size);
     this.size += batch.length;
     this.pending = [];
   }
@@ -206,7 +197,7 @@ export class Wal {
    */
   flush(): void {
     this.writePending();
-    this.durability.barrier(this.fd, this.path);
+    this.durability.barrier(this.file, this.path);
   }
 
   /**
@@ -215,7 +206,7 @@ export class Wal {
    */
   flushForCommit(): void {
     this.writePending();
-    this.durability.commitBarrier(this.fd, this.path);
+    this.durability.commitBarrier(this.file, this.path);
   }
 
   /**
@@ -224,10 +215,10 @@ export class Wal {
    * is discarded.
    */
   readAll(): WalRecord[] {
-    const size = fstatSync(this.fd).size;
+    const size = this.file.size();
     if (size === 0) return [];
     const buf = Buffer.alloc(size);
-    readSync(this.fd, buf, 0, size, 0);
+    this.file.readAt(buf, 0);
 
     const out: WalRecord[] = [];
     let pos = 0;
@@ -246,13 +237,13 @@ export class Wal {
 
   /** Empty the log (after recovery or a checkpoint folds it into the data file). */
   truncate(): void {
-    ftruncateSync(this.fd, 0);
+    this.file.truncate(0);
     this.size = 0;
     this.pending = [];
   }
 
   close(): void {
     this.flush();
-    closeSync(this.fd);
+    this.file.close();
   }
 }
