@@ -2,6 +2,7 @@ import { ParseError } from "../errors.js";
 import type { ColumnType } from "../record/schema.js";
 import type {
   Assignment,
+  CallExpr,
   ColumnDef,
   ColumnRef,
   CompareOp,
@@ -12,6 +13,7 @@ import type {
   JoinClause,
   JoinType,
   LiteralValue,
+  SelectItem,
   SelectStmt,
   Statement,
   TableRef,
@@ -284,13 +286,13 @@ class Parser {
   private parseSelect(): SelectStmt {
     this.expectKeyword("SELECT");
 
-    let columns: ColumnRef[] | "*";
+    let columns: SelectItem[] | "*";
     if (this.match("punctuation", "*")) {
       columns = "*";
     } else {
-      const list: ColumnRef[] = [];
+      const list: SelectItem[] = [];
       do {
-        list.push(this.parseColumnRef());
+        list.push(this.parseSelectItem());
       } while (this.match("punctuation", ","));
       columns = list;
     }
@@ -299,6 +301,18 @@ class Parser {
     const from = this.parseFrom();
 
     const where = this.matchKeyword("WHERE") ? this.parseExpr() : null;
+
+    let groupBy: ColumnRef[] | null = null;
+    if (this.matchKeyword("GROUP")) {
+      this.expectKeyword("BY");
+      const list: ColumnRef[] = [];
+      do {
+        list.push(this.parseColumnRef());
+      } while (this.match("punctuation", ","));
+      groupBy = list;
+    }
+
+    const having = this.matchKeyword("HAVING") ? this.parseExpr() : null;
 
     let orderBy: SelectStmt["orderBy"] = null;
     if (this.matchKeyword("ORDER")) {
@@ -315,7 +329,15 @@ class Parser {
       limit = this.parseNonNegativeInteger();
     }
 
-    return { kind: "select", columns, from, where, orderBy, limit };
+    return { kind: "select", columns, from, where, groupBy, having, orderBy, limit };
+  }
+
+  /** A SELECT-list item: a scalar/aggregate expression with an optional alias. */
+  private parseSelectItem(): SelectItem {
+    const expr = this.parsePrimary();
+    if (this.matchKeyword("AS")) return { expr, alias: this.expectIdentifier("an alias after AS") };
+    if (this.check("identifier")) return { expr, alias: this.advance().value };
+    return { expr, alias: null };
   }
 
   /** A column reference, optionally qualified by a table/alias (`u.id`). */
@@ -446,12 +468,23 @@ class Parser {
     }
     if (this.check("identifier")) {
       const first = this.advance().value;
+      if (this.match("punctuation", "(")) return this.parseCall(first);
       if (this.match("punctuation", ".")) {
         return { kind: "column", table: first, name: this.expectIdentifier('a column name after "."') };
       }
       return { kind: "column", table: null, name: first };
     }
     return { kind: "literal", value: this.parseLiteralValue() };
+  }
+
+  /** Parse a function call's arguments after the `(` (currently aggregates only). */
+  private parseCall(name: string): CallExpr {
+    let star = false;
+    let arg: Expr | null = null;
+    if (this.match("punctuation", "*")) star = true;
+    else arg = this.parseExpr();
+    this.expect("punctuation", ")", '")" after a function argument');
+    return { kind: "call", func: name.toLowerCase(), star, arg };
   }
 
   /** A literal or a `?` placeholder, for value positions (INSERT/UPDATE). */

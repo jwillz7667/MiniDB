@@ -27,6 +27,7 @@ export type PhysicalPlan =
   | PhysSeqScan
   | PhysIndexScan
   | PhysJoin
+  | PhysAggregate
   | PhysFilter
   | PhysProject
   | PhysSort
@@ -61,6 +62,19 @@ export interface PhysJoin {
   readonly rightKeyIndex?: number;
   readonly left: PhysicalPlan;
   readonly right: PhysicalPlan;
+}
+/** A resolved aggregate: function, the input column position (-1 for COUNT(*)). */
+export interface PhysAgg {
+  readonly func: string;
+  readonly argIndex: number;
+  readonly outType: ColumnType;
+}
+export interface PhysAggregate {
+  readonly op: "Aggregate";
+  readonly columns: PlanColumn[];
+  readonly groupIndices: number[];
+  readonly aggregates: PhysAgg[];
+  readonly input: PhysicalPlan;
 }
 export interface PhysFilter {
   readonly op: "Filter";
@@ -192,17 +206,36 @@ export function toPhysical(plan: LogicalPlan, limitHint?: number): PhysicalPlan 
       }
       return { op: "NestedLoopJoin", joinType: plan.joinType, columns, leftWidth, on: plan.on, left, right };
     }
+    case "aggregate": {
+      const input = toPhysical(plan.input);
+      const groupIndices = plan.groupBy.map((ref) => resolveRef(input.columns, ref));
+      const groupColumns = groupIndices.map((i) => input.columns[i]!);
+      const aggregates: PhysAgg[] = plan.aggregates.map((a) => {
+        const argIndex = a.star ? -1 : resolveRef(input.columns, a.arg!);
+        const argType = argIndex < 0 ? "INT" : input.columns[argIndex]!.type;
+        return { func: a.func, argIndex, outType: aggType(a.func, argType) };
+      });
+      const aggColumns: PlanColumn[] = plan.aggregates.map((a, k) => ({
+        name: a.outName,
+        type: aggregates[k]!.outType,
+        table: "",
+      }));
+      return { op: "Aggregate", columns: [...groupColumns, ...aggColumns], groupIndices, aggregates, input };
+    }
     case "filter": {
       const input = toPhysical(plan.input);
       return { op: "Filter", predicate: plan.predicate, columns: input.columns, input };
     }
     case "project": {
       const input = toPhysical(plan.input, limitHint); // Project preserves row count
-      const indices =
-        plan.columns === "*"
-          ? input.columns.map((_, i) => i)
-          : plan.columns.map((ref) => resolveRef(input.columns, ref));
-      const columns = indices.map((i) => input.columns[i]!);
+      if (plan.columns === "*") {
+        return { op: "Project", columns: input.columns, indices: input.columns.map((_, i) => i), input };
+      }
+      const indices = plan.columns.map((it) => resolveRef(input.columns, it.ref));
+      const columns = plan.columns.map((it, k) => {
+        const src = input.columns[indices[k]!]!;
+        return { name: it.name, type: src.type, table: src.table };
+      });
       return { op: "Project", columns, indices, input };
     }
     case "sort": {
@@ -239,8 +272,29 @@ export function toPhysical(plan: LogicalPlan, limitHint?: number): PhysicalPlan 
   }
 }
 
+/** Output type of an aggregate over a column of `argType`. */
+function aggType(func: string, argType: ColumnType): ColumnType {
+  const numeric = argType === "INT" || argType === "REAL";
+  switch (func) {
+    case "count":
+      return "INT";
+    case "sum":
+      if (numeric) return argType;
+      throw new PlanError(`sum() requires a numeric column, got ${argType}`);
+    case "avg":
+      if (numeric) return "REAL";
+      throw new PlanError(`avg() requires a numeric column, got ${argType}`);
+    case "min":
+    case "max":
+      return argType;
+    default:
+      throw new PlanError(`unknown aggregate "${func}"`);
+  }
+}
+
 function children(plan: PhysicalPlan): PhysicalPlan[] {
   switch (plan.op) {
+    case "Aggregate":
     case "Filter":
     case "Project":
     case "Sort":
@@ -272,6 +326,11 @@ function nodeLabel(plan: PhysicalPlan): string {
       return `NestedLoopJoin (${plan.joinType}) ON ${printExpr(plan.on)}`;
     case "HashJoin":
       return `HashJoin (${plan.joinType}) ON ${printExpr(plan.on)}`;
+    case "Aggregate": {
+      const by = plan.groupIndices.map((i) => plan.columns[i]!.name);
+      const aggs = plan.aggregates.map((a) => a.func);
+      return `Aggregate ${by.length ? `by (${by.join(", ")}) ` : ""}[${aggs.join(", ")}]`;
+    }
     case "Filter":
       return `Filter ${printExpr(plan.predicate)}`;
     case "Project":
@@ -321,6 +380,8 @@ export function printExpr(expr: Expr): string {
       return `?${expr.index + 1}`;
     case "column":
       return expr.table ? `${expr.table}.${expr.name}` : expr.name;
+    case "call":
+      return `${expr.func}(${expr.star ? "*" : expr.arg ? printExpr(expr.arg) : ""})`;
     case "compare":
       return `${printExpr(expr.left)} ${expr.op} ${printExpr(expr.right)}`;
     case "logical":

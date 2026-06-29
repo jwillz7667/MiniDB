@@ -4,11 +4,14 @@ import type { Catalog, TableMeta } from "../record/catalog.js";
 import { columnIndex, type Schema, type Value } from "../record/schema.js";
 import { coerceToColumnType } from "../record/value.js";
 import type {
+  CallExpr,
+  ColumnExpr,
   ColumnRef,
   DeleteStmt,
   Expr,
   InsertStmt,
   JoinType,
+  SelectItem,
   SelectStmt,
   SortDir,
   TableRef,
@@ -25,6 +28,7 @@ export type LogicalPlan =
   | LogicalScan
   | LogicalIndexScan
   | LogicalJoin
+  | LogicalAggregate
   | LogicalFilter
   | LogicalProject
   | LogicalSort
@@ -65,10 +69,32 @@ export interface LogicalFilter {
   readonly input: LogicalPlan;
 }
 
+/** One aggregate to compute per group. */
+export interface AggSpec {
+  readonly func: string; // count | sum | avg | min | max
+  readonly star: boolean; // count(*)
+  readonly arg: ColumnRef | null;
+  /** Synthetic output column name ($agg0, …) used to reference the result. */
+  readonly outName: string;
+}
+
+export interface LogicalAggregate {
+  readonly kind: "aggregate";
+  readonly groupBy: ColumnRef[];
+  readonly aggregates: AggSpec[];
+  readonly input: LogicalPlan;
+}
+
+/** A projected output column: where it comes from and its display name. */
+export interface ProjectItem {
+  readonly ref: ColumnRef;
+  readonly name: string;
+}
+
 export interface LogicalProject {
   readonly kind: "project";
-  /** Projected columns, or "*" for every column of the input. */
-  readonly columns: ColumnRef[] | "*";
+  /** Projected items, or "*" for every column of the input. */
+  readonly columns: ProjectItem[] | "*";
   readonly input: LogicalPlan;
 }
 
@@ -126,6 +152,8 @@ function validateExpr(expr: Expr, schema: Schema): void {
       return;
     case "param":
       throw new PlanError("unbound parameter in query (use a prepared statement)");
+    case "call":
+      throw new PlanError(`aggregate "${expr.func}" is not allowed in this clause`);
     case "column":
       columnIndex(schema, expr.name); // throws if unknown
       return;
@@ -142,6 +170,8 @@ function buildScan(ref: TableRef, catalog: Catalog): LogicalScan {
   return { kind: "scan", table, alias: ref.alias ?? table.name };
 }
 
+const AGGREGATE_FUNCS = new Set(["count", "sum", "avg", "min", "max"]);
+
 export function buildSelect(stmt: SelectStmt, catalog: Catalog): LogicalPlan {
   // Build the FROM tree left-deep: base, then fold each join onto the result.
   // Column references are resolved against the combined schema in the physical
@@ -154,15 +184,184 @@ export function buildSelect(stmt: SelectStmt, catalog: Catalog): LogicalPlan {
 
   if (stmt.where) plan = { kind: "filter", predicate: stmt.where, input: plan };
 
-  // Sort before project so an ORDER BY column need not appear in the projection.
-  if (stmt.orderBy) {
-    plan = { kind: "sort", column: stmt.orderBy.column, dir: stmt.orderBy.dir, input: plan };
-  }
+  return stmt.groupBy !== null || hasAggregate(stmt)
+    ? buildAggregateSelect(stmt, plan)
+    : buildSimpleSelect(stmt, plan);
+}
 
-  plan = { kind: "project", columns: stmt.columns, input: plan };
+function buildSimpleSelect(stmt: SelectStmt, input: LogicalPlan): LogicalPlan {
+  let plan = input;
+  // Sort before project so an ORDER BY column need not appear in the projection.
+  if (stmt.orderBy) plan = { kind: "sort", column: stmt.orderBy.column, dir: stmt.orderBy.dir, input: plan };
+
+  const columns =
+    stmt.columns === "*" ? "*" : stmt.columns.map((item) => simpleProjectItem(item));
+  plan = { kind: "project", columns, input: plan };
 
   if (stmt.limit !== null) plan = { kind: "limit", limit: stmt.limit, input: plan };
   return plan;
+}
+
+function buildAggregateSelect(stmt: SelectStmt, input: LogicalPlan): LogicalPlan {
+  if (stmt.columns === "*") {
+    throw new PlanError("SELECT * is not allowed with GROUP BY or aggregates; list columns explicitly");
+  }
+  const groupBy = stmt.groupBy ?? [];
+  const aggregates = collectAggregates(stmt);
+
+  let plan: LogicalPlan = { kind: "aggregate", groupBy, aggregates, input };
+
+  if (stmt.having) {
+    // HAVING may reference SELECT aliases (e.g. `HAVING n > 1` where `n` aliases
+    // an aggregate), which we map to the underlying aggregate/group column.
+    const aliases = new Map<string, ColumnRef>();
+    for (const item of stmt.columns) {
+      if (!item.alias) continue;
+      const key = item.alias.toLowerCase();
+      if (item.expr.kind === "call") {
+        aliases.set(key, { table: null, name: lookupAgg(item.expr, aggregates).outName });
+      } else if (item.expr.kind === "column") {
+        aliases.set(key, { table: item.expr.table, name: item.expr.name });
+      }
+    }
+    plan = { kind: "filter", predicate: rewriteHaving(stmt.having, aggregates, aliases), input: plan };
+  }
+
+  const items = stmt.columns.map((item) => aggregateProjectItem(item, aggregates, groupBy));
+  plan = { kind: "project", columns: items, input: plan };
+
+  // For aggregate queries, sort the projected output (so ORDER BY can use an
+  // aggregate's alias); a group column must be selected to be ordered by.
+  if (stmt.orderBy) plan = { kind: "sort", column: stmt.orderBy.column, dir: stmt.orderBy.dir, input: plan };
+  if (stmt.limit !== null) plan = { kind: "limit", limit: stmt.limit, input: plan };
+  return plan;
+}
+
+// ---- aggregate helpers ----------------------------------------------------
+
+function hasAggregate(stmt: SelectStmt): boolean {
+  if (stmt.columns !== "*" && stmt.columns.some((i) => exprHasCall(i.expr))) return true;
+  return stmt.having !== null && exprHasCall(stmt.having);
+}
+
+function exprHasCall(expr: Expr): boolean {
+  switch (expr.kind) {
+    case "call":
+      return true;
+    case "compare":
+    case "logical":
+      return exprHasCall(expr.left) || exprHasCall(expr.right);
+    default:
+      return false;
+  }
+}
+
+/** Key identifying a distinct aggregate so equal ones share one computation. */
+function aggKey(call: CallExpr): string {
+  return `${call.func}|${call.star ? "*" : refKey(asColumn(call))}`;
+}
+
+function refKey(ref: ColumnRef): string {
+  return `${(ref.table ?? "").toLowerCase()}.${ref.name.toLowerCase()}`;
+}
+
+function asColumn(call: CallExpr): ColumnRef {
+  if (call.star || call.arg === null || call.arg.kind !== "column") {
+    throw new PlanError(`aggregate "${call.func}" requires a single column argument`);
+  }
+  return { table: call.arg.table, name: call.arg.name };
+}
+
+/** Gather every distinct aggregate used in the SELECT list and HAVING. */
+function collectAggregates(stmt: SelectStmt): AggSpec[] {
+  const byKey = new Map<string, AggSpec>();
+  const visit = (expr: Expr): void => {
+    if (expr.kind === "call") {
+      if (!AGGREGATE_FUNCS.has(expr.func)) throw new PlanError(`unknown function "${expr.func}"`);
+      if (expr.star && expr.func !== "count") {
+        throw new PlanError(`${expr.func}(*) is not supported; use ${expr.func}(<column>)`);
+      }
+      const key = aggKey(expr);
+      if (!byKey.has(key)) {
+        byKey.set(key, {
+          func: expr.func,
+          star: expr.star,
+          arg: expr.star ? null : asColumn(expr),
+          outName: `$agg${byKey.size}`,
+        });
+      }
+    } else if (expr.kind === "compare" || expr.kind === "logical") {
+      visit(expr.left);
+      visit(expr.right);
+    }
+  };
+  if (stmt.columns !== "*") for (const item of stmt.columns) visit(item.expr);
+  if (stmt.having) visit(stmt.having);
+  return [...byKey.values()];
+}
+
+/**
+ * Rewrite a HAVING predicate against the aggregate output: aggregate calls
+ * become references to their computed columns, and unqualified column names that
+ * match a SELECT alias are replaced with the aliased aggregate/group column.
+ */
+function rewriteHaving(expr: Expr, aggregates: AggSpec[], aliases: Map<string, ColumnRef>): Expr {
+  switch (expr.kind) {
+    case "call":
+      return { kind: "column", table: null, name: lookupAgg(expr, aggregates).outName };
+    case "column": {
+      if (expr.table === null) {
+        const sub = aliases.get(expr.name.toLowerCase());
+        if (sub) return { kind: "column", table: sub.table, name: sub.name };
+      }
+      return expr;
+    }
+    case "compare":
+      return { ...expr, left: rewriteHaving(expr.left, aggregates, aliases), right: rewriteHaving(expr.right, aggregates, aliases) };
+    case "logical":
+      return { ...expr, left: rewriteHaving(expr.left, aggregates, aliases), right: rewriteHaving(expr.right, aggregates, aliases) };
+    default:
+      return expr;
+  }
+}
+
+function lookupAgg(call: CallExpr, aggregates: AggSpec[]): AggSpec {
+  const key = aggKey(call);
+  const spec = aggregates.find((a) => `${a.func}|${a.star ? "*" : refKey(a.arg!)}` === key);
+  if (!spec) throw new PlanError(`aggregate ${call.func} not collected`);
+  return spec;
+}
+
+function simpleProjectItem(item: SelectItem): ProjectItem {
+  if (item.expr.kind !== "column") {
+    throw new PlanError("only column references are allowed here (did you mean to add GROUP BY?)");
+  }
+  const col = item.expr;
+  return { ref: { table: col.table, name: col.name }, name: item.alias ?? col.name };
+}
+
+function aggregateProjectItem(item: SelectItem, aggregates: AggSpec[], groupBy: ColumnRef[]): ProjectItem {
+  if (item.expr.kind === "call") {
+    const spec = lookupAgg(item.expr, aggregates);
+    return { ref: { table: null, name: spec.outName }, name: item.alias ?? defaultAggName(spec) };
+  }
+  if (item.expr.kind === "column") {
+    const col: ColumnExpr = item.expr;
+    if (!groupBy.some((g) => sameRef(g, col))) {
+      throw new PlanError(`column "${col.name}" must appear in GROUP BY or be used in an aggregate`);
+    }
+    return { ref: { table: col.table, name: col.name }, name: item.alias ?? col.name };
+  }
+  throw new PlanError("a grouped SELECT list may only contain group columns and aggregates");
+}
+
+function defaultAggName(spec: AggSpec): string {
+  return spec.func;
+}
+
+function sameRef(a: ColumnRef, b: { table: string | null; name: string }): boolean {
+  if (a.name.toLowerCase() !== b.name.toLowerCase()) return false;
+  return a.table === null || b.table === null || a.table.toLowerCase() === b.table.toLowerCase();
 }
 
 export function buildInsert(stmt: InsertStmt, catalog: Catalog): LogicalInsert {

@@ -40,6 +40,8 @@ export const KEYWORDS: ReadonlySet<string> = new Set([
   "LEFT",
   "OUTER",
   "WHERE",
+  "GROUP",
+  "HAVING",
   "ORDER",
   "BY",
   "ASC",

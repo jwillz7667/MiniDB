@@ -77,10 +77,16 @@ function rewrite(stmt: Statement, params: readonly LiteralValue[]): Statement {
 
 function rewriteSelect(stmt: SelectStmt, params: readonly LiteralValue[]): SelectStmt {
   const joins = stmt.from.joins.map((j) => ({ ...j, on: bindExpr(j.on, params) }));
+  const columns =
+    stmt.columns === "*"
+      ? "*"
+      : stmt.columns.map((item) => ({ ...item, expr: bindExpr(item.expr, params) }));
   return {
     ...stmt,
+    columns,
     from: { ...stmt.from, joins },
     where: stmt.where === null ? null : bindExpr(stmt.where, params),
+    having: stmt.having === null ? null : bindExpr(stmt.having, params),
   };
 }
 
@@ -117,6 +123,8 @@ export function bindExpr(expr: Expr, params: readonly LiteralValue[]): Expr {
     case "literal":
     case "column":
       return expr;
+    case "call":
+      return expr.arg === null ? expr : { ...expr, arg: bindExpr(expr.arg, params) };
     case "compare":
       return { ...expr, left: bindExpr(expr.left, params), right: bindExpr(expr.right, params) };
     case "logical":
