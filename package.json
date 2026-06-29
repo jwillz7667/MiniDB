@@ -1,7 +1,7 @@
 {
   "name": "minidb",
-  "version": "1.0.0",
-  "description": "A real, durable SQL database engine from scratch in TypeScript: B+Tree storage, write-ahead log, ARIES-lite crash recovery, a Volcano executor, and MVCC snapshot isolation.",
+  "version": "2.0.0",
+  "description": "A durable, zero-native-dependency SQL database engine in TypeScript: B+Tree storage, write-ahead log + ARIES-lite crash recovery, a Volcano executor with JOINs and aggregates, prepared statements, an in-memory backend, and a Kysely dialect.",
   "type": "module",
   "license": "MIT",
   "author": "jwillz7667",
@@ -9,20 +9,57 @@
     "type": "git",
     "url": "https://github.com/jwillz7667/MiniDB.git"
   },
+  "keywords": [
+    "database",
+    "sql",
+    "sqlite",
+    "embedded",
+    "b-tree",
+    "wal",
+    "crash-recovery",
+    "in-memory",
+    "kysely",
+    "typescript",
+    "pure-js",
+    "no-native"
+  ],
   "engines": {
     "node": ">=20"
   },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./kysely": {
+      "types": "./dist/kysely/index.d.ts",
+      "import": "./dist/kysely/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
   "bin": {
     "minidb": "./dist/repl.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "pnpm build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "repl": "tsx src/repl.ts",
     "bench": "tsx src/bench/bench.ts",
+    "bench:vs-sqlite": "tsx scripts/bench-vs-sqlite.ts",
+    "example": "tsx examples/quickstart.ts",
     "demo:pool": "tsx scripts/demo-pool.ts",
     "demo:crash": "tsx scripts/demo-crash.ts",
     "demo:explain": "tsx scripts/demo-explain.ts"

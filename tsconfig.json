@@ -25,6 +25,6 @@
     "outDir": "dist",
     "rootDir": "."
   },
-  "include": ["src", "tests", "scripts"],
+  "include": ["src", "tests", "scripts", "examples"],
   "exclude": ["node_modules", "dist"]
 }
