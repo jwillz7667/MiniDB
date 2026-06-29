@@ -100,7 +100,7 @@ describe("parser", () => {
     expect(stmt.columns).toEqual([selitem("id"), selitem("name")]);
     expect(stmt.from).toEqual({ base: { table: "users", alias: null }, joins: [] });
     expect(stmt.orderBy).toEqual({ column: colref("name"), dir: "DESC" });
-    expect(stmt.limit).toBe(5);
+    expect(stmt.limit).toEqual(lit(5n));
     expect(stmt.where).toEqual({
       kind: "compare",
       op: ">=",

@@ -50,6 +50,29 @@ export function tokenize(source: string): Token[] {
       tokens.push({ type, value, line: startLine, column: startColumn });
     };
 
+    // Double-quoted identifier ("user", "select") — case-sensitive, never a
+    // keyword (so reserved words and mixed case work as column/table names).
+    if (c === '"') {
+      advance(); // opening quote
+      let text = "";
+      for (;;) {
+        if (pos >= source.length) {
+          throw new LexError("unterminated quoted identifier", startLine, startColumn);
+        }
+        const ch = advance();
+        if (ch === '"') {
+          if (peek() === '"') {
+            text += advance(); // "" escapes a quote
+            continue;
+          }
+          break;
+        }
+        text += ch;
+      }
+      push("identifier", text);
+      continue;
+    }
+
     // Blob hex literal: X'48656c6c6f'. Must precede the identifier rule so a
     // lone `x`/`X` followed by a quote is read as a blob, not an identifier.
     if ((c === "X" || c === "x") && peek(1) === "'") {
