@@ -29,6 +29,8 @@ export function optimize(plan: LogicalPlan, catalog: Catalog): LogicalPlan {
       if (input.kind === "scan") return selectIndex(plan.predicate, input, catalog);
       return { kind: "filter", predicate: plan.predicate, input };
     }
+    case "join":
+      return { ...plan, left: optimize(plan.left, catalog), right: optimize(plan.right, catalog) };
     case "project":
     case "sort":
     case "limit":
@@ -66,6 +68,7 @@ function selectIndex(predicate: Expr, scan: LogicalScan, catalog: Catalog): Logi
     const indexScan: LogicalIndexScan = {
       kind: "indexScan",
       table: scan.table,
+      alias: scan.alias,
       column: hit.column,
       root: hit.root,
       lo: hit.lo,

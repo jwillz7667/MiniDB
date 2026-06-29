@@ -7,7 +7,7 @@ export type TokenType =
   | "string"
   | "blob" // X'48656c6c6f' hex literal; value is the hex digits
   | "operator" // = != < <= > >=
-  | "punctuation" // ( ) , * ; - ?
+  | "punctuation" // ( ) , * ; - ? .
   | "eof";
 
 export interface Token {
@@ -34,6 +34,11 @@ export const KEYWORDS: ReadonlySet<string> = new Set([
   "VALUES",
   "SELECT",
   "FROM",
+  "AS",
+  "JOIN",
+  "INNER",
+  "LEFT",
+  "OUTER",
   "WHERE",
   "ORDER",
   "BY",

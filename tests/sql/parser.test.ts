@@ -14,6 +14,10 @@ import type { ColumnType } from "../../src/record/schema.js";
 import { parse } from "../../src/sql/parser.js";
 
 const lit = (value: LiteralValue): LiteralExpr => ({ kind: "literal", value });
+const colref = (name: string, table: string | null = null): { table: string | null; name: string } => ({
+  table,
+  name,
+});
 
 const coldef = (name: string, type: ColumnType, nullable: boolean): ColumnDef => ({
   name,
@@ -89,14 +93,14 @@ describe("parser", () => {
     const stmt = parse(
       "SELECT id, name FROM users WHERE id >= 10 ORDER BY name DESC LIMIT 5",
     ) as SelectStmt;
-    expect(stmt.columns).toEqual(["id", "name"]);
-    expect(stmt.table).toBe("users");
-    expect(stmt.orderBy).toEqual({ column: "name", dir: "DESC" });
+    expect(stmt.columns).toEqual([colref("id"), colref("name")]);
+    expect(stmt.from).toEqual({ base: { table: "users", alias: null }, joins: [] });
+    expect(stmt.orderBy).toEqual({ column: colref("name"), dir: "DESC" });
     expect(stmt.limit).toBe(5);
     expect(stmt.where).toEqual({
       kind: "compare",
       op: ">=",
-      left: { kind: "column", name: "id" },
+      left: { kind: "column", table: null, name: "id" },
       right: { kind: "literal", value: 10n },
     });
   });
@@ -104,7 +108,27 @@ describe("parser", () => {
   it("parses SELECT * with default ascending order", () => {
     const stmt = parse("SELECT * FROM t ORDER BY x") as SelectStmt;
     expect(stmt.columns).toBe("*");
-    expect(stmt.orderBy).toEqual({ column: "x", dir: "ASC" });
+    expect(stmt.orderBy).toEqual({ column: colref("x"), dir: "ASC" });
+  });
+
+  it("parses a JOIN with aliases, qualified columns, and an ON clause", () => {
+    const stmt = parse(
+      "SELECT u.id, o.total FROM users u LEFT JOIN orders AS o ON u.id = o.user_id",
+    ) as SelectStmt;
+    expect(stmt.columns).toEqual([colref("id", "u"), colref("total", "o")]);
+    expect(stmt.from.base).toEqual({ table: "users", alias: "u" });
+    expect(stmt.from.joins).toEqual([
+      {
+        type: "left",
+        right: { table: "orders", alias: "o" },
+        on: {
+          kind: "compare",
+          op: "=",
+          left: { kind: "column", table: "u", name: "id" },
+          right: { kind: "column", table: "o", name: "user_id" },
+        },
+      },
+    ]);
   });
 
   it("parses DELETE with a WHERE clause", () => {
@@ -113,7 +137,7 @@ describe("parser", () => {
     expect(stmt.where).toEqual({
       kind: "compare",
       op: "=",
-      left: { kind: "column", name: "id" },
+      left: { kind: "column", table: null, name: "id" },
       right: { kind: "literal", value: 1n },
     });
   });
@@ -130,20 +154,20 @@ describe("parser", () => {
         left: {
           kind: "compare",
           op: "=",
-          left: { kind: "column", name: "a" },
+          left: { kind: "column", table: null, name: "a" },
           right: { kind: "literal", value: 1n },
         },
         right: {
           kind: "compare",
           op: ">",
-          left: { kind: "column", name: "b" },
+          left: { kind: "column", table: null, name: "b" },
           right: { kind: "literal", value: 2n },
         },
       },
       right: {
         kind: "compare",
         op: "=",
-        left: { kind: "column", name: "c" },
+        left: { kind: "column", table: null, name: "c" },
         right: { kind: "literal", value: 3n },
       },
     });

@@ -1,12 +1,12 @@
 import { ExecutionError } from "../errors.js";
 import type { TableMeta } from "../record/catalog.js";
-import type { Column, Value } from "../record/schema.js";
+import type { Value } from "../record/schema.js";
 import { sortCompare } from "../record/value.js";
 import { BTree } from "../storage/btree.js";
 import type { Rid } from "../storage/rid.js";
-import type { Expr } from "../sql/ast.js";
+import type { Expr, JoinType } from "../sql/ast.js";
 import type { ResolvedAssignment } from "../plan/logical.js";
-import type { PhysicalPlan } from "../plan/physical.js";
+import type { PhysicalPlan, PlanColumn } from "../plan/physical.js";
 import type { ExecContext } from "./context.js";
 import { type CompiledExpr, compileExpr, compilePredicate } from "./eval.js";
 import type { ScannedRow } from "./table-store.js";
@@ -20,23 +20,23 @@ export interface ExecTuple {
 
 /** The Volcano iterator interface: every operator pulls rows one at a time. */
 export interface Operator {
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   open(): void;
   next(): ExecTuple | null;
   close(): void;
 }
 
+const nulls = (n: number): Value[] => new Array<Value>(n).fill(null);
+
 /** Walk every live row in a table's heap. */
 class SeqScanOp implements Operator {
-  readonly columns: Column[];
   private iter: Generator<ScannedRow> | null = null;
 
   constructor(
     private readonly ctx: ExecContext,
     private readonly table: TableMeta,
-  ) {
-    this.columns = table.columns;
-  }
+    readonly columns: PlanColumn[],
+  ) {}
 
   open(): void {
     this.iter = this.ctx.store.scan(this.ctx.tx, this.table);
@@ -54,18 +54,16 @@ class SeqScanOp implements Operator {
 
 /** Use a B+Tree to fetch only the rids in a key range, then load those rows. */
 class IndexScanOp implements Operator {
-  readonly columns: Column[];
   private gen: Generator<[bigint, Rid]> | null = null;
 
   constructor(
     private readonly ctx: ExecContext,
     private readonly table: TableMeta,
+    readonly columns: PlanColumn[],
     private readonly root: number,
     private readonly lo: bigint,
     private readonly hi: bigint,
-  ) {
-    this.columns = table.columns;
-  }
+  ) {}
 
   open(): void {
     this.gen = BTree.rangeScan(this.ctx.tx, this.root, this.lo, this.hi);
@@ -83,9 +81,143 @@ class IndexScanOp implements Operator {
   }
 }
 
+/** Combine two inputs by re-scanning the right input for every left row. */
+class NestedLoopJoinOp implements Operator {
+  private readonly test: (values: Value[]) => boolean;
+  private currentLeft: ExecTuple | null = null;
+  private rightOpen = false;
+  private matched = false;
+
+  constructor(
+    private readonly left: Operator,
+    private readonly right: Operator,
+    readonly columns: PlanColumn[],
+    private readonly joinType: JoinType,
+    on: Expr,
+    private readonly rightWidth: number,
+  ) {
+    this.test = compilePredicate(on, columns);
+  }
+
+  open(): void {
+    this.left.open();
+    this.currentLeft = null;
+    this.rightOpen = false;
+    this.matched = false;
+  }
+
+  next(): ExecTuple | null {
+    for (;;) {
+      if (this.currentLeft === null) {
+        this.currentLeft = this.left.next();
+        if (this.currentLeft === null) return null;
+        this.right.open();
+        this.rightOpen = true;
+        this.matched = false;
+      }
+      const r = this.right.next();
+      if (r !== null) {
+        const values = [...this.currentLeft.values, ...r.values];
+        if (this.test(values)) {
+          this.matched = true;
+          return { rowid: this.currentLeft.rowid, rid: this.currentLeft.rid, values };
+        }
+        continue;
+      }
+      this.right.close();
+      this.rightOpen = false;
+      const left = this.currentLeft;
+      this.currentLeft = null;
+      if (this.joinType === "left" && !this.matched) {
+        return { rowid: left.rowid, rid: left.rid, values: [...left.values, ...nulls(this.rightWidth)] };
+      }
+    }
+  }
+
+  close(): void {
+    if (this.rightOpen) this.right.close();
+    this.left.close();
+  }
+}
+
+/** A normalized hash key for an equi-join (numeric INT/REAL share a key). */
+function joinKey(v: Exclude<Value, null>): string {
+  if (typeof v === "bigint" || typeof v === "number") return `n${String(v)}`;
+  if (typeof v === "string") return `s${v}`;
+  if (typeof v === "boolean") return `b${v ? 1 : 0}`;
+  if (v instanceof Date) return `t${v.getTime()}`;
+  return `x${Buffer.from(v as Uint8Array).toString("hex")}`;
+}
+
+/** Equi-join: hash the right input on its key, then probe with each left row. */
+class HashJoinOp implements Operator {
+  private buckets = new Map<string, ExecTuple[]>();
+  private leftRow: ExecTuple | null = null;
+  private bucket: ExecTuple[] = [];
+  private bucketPos = 0;
+  private matchedCurrent = false;
+
+  constructor(
+    private readonly left: Operator,
+    private readonly right: Operator,
+    readonly columns: PlanColumn[],
+    private readonly joinType: JoinType,
+    private readonly leftKeyIndex: number,
+    private readonly rightKeyIndex: number,
+    private readonly rightWidth: number,
+  ) {}
+
+  open(): void {
+    this.left.open();
+    this.buckets = new Map();
+    this.right.open();
+    try {
+      for (let r = this.right.next(); r !== null; r = this.right.next()) {
+        const k = r.values[this.rightKeyIndex]!;
+        if (k === null) continue; // NULL keys never join
+        const key = joinKey(k);
+        const arr = this.buckets.get(key);
+        if (arr) arr.push(r);
+        else this.buckets.set(key, [r]);
+      }
+    } finally {
+      this.right.close();
+    }
+    this.leftRow = null;
+    this.bucket = [];
+    this.bucketPos = 0;
+  }
+
+  next(): ExecTuple | null {
+    for (;;) {
+      if (this.bucketPos < this.bucket.length) {
+        this.matchedCurrent = true;
+        const r = this.bucket[this.bucketPos++]!;
+        return { rowid: this.leftRow!.rowid, rid: this.leftRow!.rid, values: [...this.leftRow!.values, ...r.values] };
+      }
+      if (this.leftRow !== null && this.joinType === "left" && !this.matchedCurrent) {
+        const left = this.leftRow;
+        this.leftRow = null;
+        return { rowid: left.rowid, rid: left.rid, values: [...left.values, ...nulls(this.rightWidth)] };
+      }
+      this.leftRow = this.left.next();
+      if (this.leftRow === null) return null;
+      this.matchedCurrent = false;
+      const k = this.leftRow.values[this.leftKeyIndex]!;
+      this.bucket = k === null ? [] : (this.buckets.get(joinKey(k)) ?? []);
+      this.bucketPos = 0;
+    }
+  }
+
+  close(): void {
+    this.left.close();
+    this.buckets.clear();
+  }
+}
+
 /** Drop rows that fail the predicate. */
 class FilterOp implements Operator {
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   private readonly test: (values: Value[]) => boolean;
 
   constructor(
@@ -117,7 +249,7 @@ class FilterOp implements Operator {
 class ProjectOp implements Operator {
   constructor(
     private readonly child: Operator,
-    readonly columns: Column[],
+    readonly columns: PlanColumn[],
     private readonly indices: number[],
   ) {}
 
@@ -143,7 +275,7 @@ class ProjectOp implements Operator {
  * exhausting memory.
  */
 class SortOp implements Operator {
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   private buffer: ExecTuple[] = [];
   private pos = 0;
 
@@ -174,8 +306,6 @@ class SortOp implements Operator {
     for (let t = this.child.next(); t !== null; t = this.child.next()) {
       if (n === 0) continue;
       if (kept.length < n) {
-        // A LIMIT larger than the cap must still fail safe rather than buffer
-        // the whole table (do NOT clamp n — that would change results).
         if (kept.length >= this.maxRows) {
           throw new ExecutionError(
             `ORDER BY buffered more than ${this.maxRows} rows; lower the LIMIT or add a tighter WHERE`,
@@ -227,7 +357,7 @@ class SortOp implements Operator {
 
 /** Stop after N rows. */
 class LimitOp implements Operator {
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   private produced = 0;
 
   constructor(
@@ -257,17 +387,15 @@ class LimitOp implements Operator {
 
 /** Write rows into the heap and all indexes; emits each inserted tuple. */
 class InsertOp implements Operator {
-  readonly columns: Column[];
   private pos = 0;
 
   constructor(
     private readonly ctx: ExecContext,
     private readonly table: TableMeta,
+    readonly columns: PlanColumn[],
     private readonly rows: Value[][],
     private readonly autoIncrement: { columnIndex: number; indexRoot: number } | undefined,
-  ) {
-    this.columns = table.columns;
-  }
+  ) {}
 
   open(): void {
     this.pos = 0;
@@ -302,7 +430,7 @@ class InsertOp implements Operator {
  * Halloween problem. Each new value is computed against the row's OLD values.
  */
 class UpdateOp implements Operator {
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   private readonly setters: { readonly index: number; readonly compute: CompiledExpr }[];
   private pending: ExecTuple[] = [];
   private pos = 0;
@@ -313,10 +441,10 @@ class UpdateOp implements Operator {
     private readonly child: Operator,
     assignments: ResolvedAssignment[],
   ) {
-    this.columns = table.columns;
+    this.columns = child.columns;
     this.setters = assignments.map((a) => ({
       index: a.index,
-      compute: compileExpr(a.value, table.columns),
+      compute: compileExpr(a.value, child.columns),
     }));
   }
 
@@ -347,14 +475,14 @@ class UpdateOp implements Operator {
 
 /** Delete each row pulled from the child; emits the deleted tuples. */
 class DeleteOp implements Operator {
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
 
   constructor(
     private readonly ctx: ExecContext,
     private readonly table: TableMeta,
     private readonly child: Operator,
   ) {
-    this.columns = table.columns;
+    this.columns = child.columns;
   }
 
   open(): void {
@@ -377,9 +505,28 @@ class DeleteOp implements Operator {
 export function buildOperator(plan: PhysicalPlan, ctx: ExecContext): Operator {
   switch (plan.op) {
     case "SeqScan":
-      return new SeqScanOp(ctx, plan.table);
+      return new SeqScanOp(ctx, plan.table, plan.columns);
     case "IndexScan":
-      return new IndexScanOp(ctx, plan.table, plan.root, plan.lo, plan.hi);
+      return new IndexScanOp(ctx, plan.table, plan.columns, plan.root, plan.lo, plan.hi);
+    case "NestedLoopJoin":
+      return new NestedLoopJoinOp(
+        buildOperator(plan.left, ctx),
+        buildOperator(plan.right, ctx),
+        plan.columns,
+        plan.joinType,
+        plan.on,
+        plan.columns.length - plan.leftWidth,
+      );
+    case "HashJoin":
+      return new HashJoinOp(
+        buildOperator(plan.left, ctx),
+        buildOperator(plan.right, ctx),
+        plan.columns,
+        plan.joinType,
+        plan.leftKeyIndex!,
+        plan.rightKeyIndex!,
+        plan.columns.length - plan.leftWidth,
+      );
     case "Filter":
       return new FilterOp(buildOperator(plan.input, ctx), plan.predicate);
     case "Project":
@@ -395,7 +542,7 @@ export function buildOperator(plan: PhysicalPlan, ctx: ExecContext): Operator {
     case "Limit":
       return new LimitOp(buildOperator(plan.input, ctx), plan.limit);
     case "Insert":
-      return new InsertOp(ctx, plan.table, plan.rows, plan.autoIncrement);
+      return new InsertOp(ctx, plan.table, plan.columns, plan.rows, plan.autoIncrement);
     case "Update":
       return new UpdateOp(ctx, plan.table, buildOperator(plan.input, ctx), plan.assignments);
     case "Delete":

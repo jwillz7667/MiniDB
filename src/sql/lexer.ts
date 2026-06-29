@@ -163,8 +163,17 @@ export function tokenize(source: string): Token[] {
       continue;
     }
 
-    // Punctuation. "?" is a positional bind placeholder.
-    if (c === "(" || c === ")" || c === "," || c === "*" || c === ";" || c === "-" || c === "?") {
+    // Punctuation. "?" is a positional bind placeholder; "." qualifies columns.
+    if (
+      c === "(" ||
+      c === ")" ||
+      c === "," ||
+      c === "*" ||
+      c === ";" ||
+      c === "-" ||
+      c === "?" ||
+      c === "."
+    ) {
       advance();
       push("punctuation", c);
       continue;

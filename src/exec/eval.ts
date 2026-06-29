@@ -1,15 +1,26 @@
 import { ExecutionError } from "../errors.js";
-import type { Column, Value } from "../record/schema.js";
+import type { Value } from "../record/schema.js";
 import { compareValues } from "../record/value.js";
 import type { CompareOp, Expr } from "../sql/ast.js";
+import type { PlanColumn } from "../plan/physical.js";
 
 /** A compiled expression: evaluate it against a positional row of values. */
 export type CompiledExpr = (values: Value[]) => Value;
 
-function resolveColumn(columns: Column[], name: string): number {
-  const idx = columns.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
-  if (idx < 0) throw new ExecutionError(`unknown column "${name}"`);
-  return idx;
+/** Resolve a (possibly qualified) column reference to a positional index. */
+function resolveColumn(columns: PlanColumn[], table: string | null, name: string): number {
+  const lname = name.toLowerCase();
+  const ltable = table?.toLowerCase();
+  let found = -1;
+  for (let i = 0; i < columns.length; i++) {
+    const c = columns[i]!;
+    if (c.name.toLowerCase() === lname && (ltable === undefined || c.table.toLowerCase() === ltable)) {
+      if (found >= 0) throw new ExecutionError(`ambiguous column "${name}" (qualify it with a table name)`);
+      found = i;
+    }
+  }
+  if (found < 0) throw new ExecutionError(`unknown column "${table ? `${table}.` : ""}${name}"`);
+  return found;
 }
 
 function applyCompare(op: CompareOp, a: Value, b: Value): boolean {
@@ -42,7 +53,7 @@ function asBool(v: Value): boolean {
  * Compile an expression into a fast closure, resolving column references to
  * positional indices up front so per-row evaluation does no name lookups.
  */
-export function compileExpr(expr: Expr, columns: Column[]): CompiledExpr {
+export function compileExpr(expr: Expr, columns: PlanColumn[]): CompiledExpr {
   switch (expr.kind) {
     case "literal": {
       const v = expr.value;
@@ -53,7 +64,7 @@ export function compileExpr(expr: Expr, columns: Column[]): CompiledExpr {
       // a statement was run without being bound.
       throw new ExecutionError(`unbound parameter ?${expr.index + 1} (use a prepared statement)`);
     case "column": {
-      const idx = resolveColumn(columns, expr.name);
+      const idx = resolveColumn(columns, expr.table, expr.name);
       return (values) => values[idx]!;
     }
     case "compare": {
@@ -74,7 +85,7 @@ export function compileExpr(expr: Expr, columns: Column[]): CompiledExpr {
 }
 
 /** Compile an expression used as a WHERE predicate (result coerced to boolean). */
-export function compilePredicate(expr: Expr, columns: Column[]): (values: Value[]) => boolean {
+export function compilePredicate(expr: Expr, columns: PlanColumn[]): (values: Value[]) => boolean {
   const compiled = compileExpr(expr, columns);
   return (values) => asBool(compiled(values));
 }

@@ -4,11 +4,14 @@ import type { Catalog, TableMeta } from "../record/catalog.js";
 import { columnIndex, type Schema, type Value } from "../record/schema.js";
 import { coerceToColumnType } from "../record/value.js";
 import type {
+  ColumnRef,
   DeleteStmt,
   Expr,
   InsertStmt,
+  JoinType,
   SelectStmt,
   SortDir,
+  TableRef,
   UpdateStmt,
   ValueExpr,
 } from "../sql/ast.js";
@@ -21,6 +24,7 @@ import type {
 export type LogicalPlan =
   | LogicalScan
   | LogicalIndexScan
+  | LogicalJoin
   | LogicalFilter
   | LogicalProject
   | LogicalSort
@@ -32,16 +36,27 @@ export type LogicalPlan =
 export interface LogicalScan {
   readonly kind: "scan";
   readonly table: TableMeta;
+  /** Name columns are qualified by (the FROM alias, or the table name). */
+  readonly alias: string;
 }
 
 /** Produced only by the optimizer when a predicate hits an indexed column. */
 export interface LogicalIndexScan {
   readonly kind: "indexScan";
   readonly table: TableMeta;
+  readonly alias: string;
   readonly column: string;
   readonly root: number;
   readonly lo: bigint;
   readonly hi: bigint;
+}
+
+export interface LogicalJoin {
+  readonly kind: "join";
+  readonly joinType: JoinType;
+  readonly on: Expr;
+  readonly left: LogicalPlan;
+  readonly right: LogicalPlan;
 }
 
 export interface LogicalFilter {
@@ -52,13 +67,14 @@ export interface LogicalFilter {
 
 export interface LogicalProject {
   readonly kind: "project";
-  readonly columns: string[];
+  /** Projected columns, or "*" for every column of the input. */
+  readonly columns: ColumnRef[] | "*";
   readonly input: LogicalPlan;
 }
 
 export interface LogicalSort {
   readonly kind: "sort";
-  readonly column: string;
+  readonly column: ColumnRef;
   readonly dir: SortDir;
   readonly input: LogicalPlan;
 }
@@ -121,29 +137,31 @@ function validateExpr(expr: Expr, schema: Schema): void {
   }
 }
 
-export function buildSelect(stmt: SelectStmt, catalog: Catalog): LogicalPlan {
-  const table = catalog.requireTable(stmt.table);
-  let plan: LogicalPlan = { kind: "scan", table };
+function buildScan(ref: TableRef, catalog: Catalog): LogicalScan {
+  const table = catalog.requireTable(ref.table);
+  return { kind: "scan", table, alias: ref.alias ?? table.name };
+}
 
-  if (stmt.where) {
-    validateExpr(stmt.where, table.schema);
-    plan = { kind: "filter", predicate: stmt.where, input: plan };
+export function buildSelect(stmt: SelectStmt, catalog: Catalog): LogicalPlan {
+  // Build the FROM tree left-deep: base, then fold each join onto the result.
+  // Column references are resolved against the combined schema in the physical
+  // layer, where every table's columns (and aliases) are known.
+  let plan: LogicalPlan = buildScan(stmt.from.base, catalog);
+  for (const join of stmt.from.joins) {
+    const right = buildScan(join.right, catalog);
+    plan = { kind: "join", joinType: join.type, on: join.on, left: plan, right };
   }
+
+  if (stmt.where) plan = { kind: "filter", predicate: stmt.where, input: plan };
 
   // Sort before project so an ORDER BY column need not appear in the projection.
   if (stmt.orderBy) {
-    columnIndex(table.schema, stmt.orderBy.column);
     plan = { kind: "sort", column: stmt.orderBy.column, dir: stmt.orderBy.dir, input: plan };
   }
 
-  const columns =
-    stmt.columns === "*" ? table.columns.map((c) => c.name) : stmt.columns;
-  for (const name of columns) columnIndex(table.schema, name); // validate
-  plan = { kind: "project", columns, input: plan };
+  plan = { kind: "project", columns: stmt.columns, input: plan };
 
-  if (stmt.limit !== null) {
-    plan = { kind: "limit", limit: stmt.limit, input: plan };
-  }
+  if (stmt.limit !== null) plan = { kind: "limit", limit: stmt.limit, input: plan };
   return plan;
 }
 
@@ -192,7 +210,7 @@ export function buildDelete(stmt: DeleteStmt, catalog: Catalog): LogicalDelete {
   const table = catalog.requireTable(stmt.table);
   requireWritable(table);
 
-  let input: LogicalPlan = { kind: "scan", table };
+  let input: LogicalPlan = { kind: "scan", table, alias: table.name };
   if (stmt.where) {
     validateExpr(stmt.where, table.schema);
     input = { kind: "filter", predicate: stmt.where, input };
@@ -214,7 +232,7 @@ export function buildUpdate(stmt: UpdateStmt, catalog: Catalog): LogicalUpdate {
     return { index, value: a.value };
   });
 
-  let input: LogicalPlan = { kind: "scan", table };
+  let input: LogicalPlan = { kind: "scan", table, alias: table.name };
   if (stmt.where) {
     validateExpr(stmt.where, table.schema);
     input = { kind: "filter", predicate: stmt.where, input };

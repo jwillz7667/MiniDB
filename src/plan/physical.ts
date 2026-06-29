@@ -1,11 +1,22 @@
+import { PlanError } from "../errors.js";
 import type { TableMeta } from "../record/catalog.js";
-import { type Column, columnIndex, type Value } from "../record/schema.js";
+import { type Column, type ColumnType, type Value } from "../record/schema.js";
 import { valueToLiteral } from "../record/value.js";
-import type { Expr, SortDir } from "../sql/ast.js";
+import type { ColumnRef, Expr, JoinType, SortDir } from "../sql/ast.js";
 import type { LogicalPlan, ResolvedAssignment } from "./logical.js";
 
 const I64_MIN = -9_223_372_036_854_775_808n;
 const I64_MAX = 9_223_372_036_854_775_807n;
+
+/**
+ * A column in an operator's output: its name and type plus the table/alias it
+ * came from, so a reference like `u.id` resolves unambiguously across a join.
+ */
+export interface PlanColumn {
+  readonly name: string;
+  readonly type: ColumnType;
+  readonly table: string;
+}
 
 /**
  * The physical plan: the optimized logical plan bound to concrete operators,
@@ -15,6 +26,7 @@ const I64_MAX = 9_223_372_036_854_775_807n;
 export type PhysicalPlan =
   | PhysSeqScan
   | PhysIndexScan
+  | PhysJoin
   | PhysFilter
   | PhysProject
   | PhysSort
@@ -26,32 +38,45 @@ export type PhysicalPlan =
 export interface PhysSeqScan {
   readonly op: "SeqScan";
   readonly table: TableMeta;
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
 }
 export interface PhysIndexScan {
   readonly op: "IndexScan";
   readonly table: TableMeta;
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   readonly column: string;
   readonly root: number;
   readonly lo: bigint;
   readonly hi: bigint;
 }
+export interface PhysJoin {
+  readonly op: "NestedLoopJoin" | "HashJoin";
+  readonly joinType: JoinType;
+  readonly columns: PlanColumn[];
+  /** Number of columns contributed by the left input (where right columns begin). */
+  readonly leftWidth: number;
+  readonly on: Expr;
+  /** For HashJoin: equality key positions within the left / right inputs. */
+  readonly leftKeyIndex?: number;
+  readonly rightKeyIndex?: number;
+  readonly left: PhysicalPlan;
+  readonly right: PhysicalPlan;
+}
 export interface PhysFilter {
   readonly op: "Filter";
   readonly predicate: Expr;
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   readonly input: PhysicalPlan;
 }
 export interface PhysProject {
   readonly op: "Project";
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   readonly indices: number[];
   readonly input: PhysicalPlan;
 }
 export interface PhysSort {
   readonly op: "Sort";
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   readonly sortIndex: number;
   readonly dir: SortDir;
   /** When an enclosing LIMIT is known, the sort keeps only this many rows (top-N). */
@@ -60,29 +85,71 @@ export interface PhysSort {
 }
 export interface PhysLimit {
   readonly op: "Limit";
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   readonly limit: number;
   readonly input: PhysicalPlan;
 }
 export interface PhysInsert {
   readonly op: "Insert";
   readonly table: TableMeta;
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   readonly rows: Value[][];
   readonly autoIncrement?: { columnIndex: number; indexRoot: number };
 }
 export interface PhysUpdate {
   readonly op: "Update";
   readonly table: TableMeta;
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   readonly assignments: ResolvedAssignment[];
   readonly input: PhysicalPlan;
 }
 export interface PhysDelete {
   readonly op: "Delete";
   readonly table: TableMeta;
-  readonly columns: Column[];
+  readonly columns: PlanColumn[];
   readonly input: PhysicalPlan;
+}
+
+function planColumns(table: TableMeta, alias: string): PlanColumn[] {
+  return table.columns.map((c: Column) => ({ name: c.name, type: c.type, table: alias }));
+}
+
+/** Resolve a (possibly qualified) reference to a positional index in `columns`. */
+export function resolveRef(columns: PlanColumn[], ref: ColumnRef): number {
+  const name = ref.name.toLowerCase();
+  const table = ref.table?.toLowerCase();
+  const matches: number[] = [];
+  for (let i = 0; i < columns.length; i++) {
+    const c = columns[i]!;
+    if (c.name.toLowerCase() === name && (table === undefined || c.table.toLowerCase() === table)) {
+      matches.push(i);
+    }
+  }
+  if (matches.length === 0) {
+    throw new PlanError(`unknown column "${ref.table ? `${ref.table}.` : ""}${ref.name}"`);
+  }
+  if (matches.length > 1) {
+    throw new PlanError(`ambiguous column "${ref.name}" (qualify it with a table name)`);
+  }
+  return matches[0]!;
+}
+
+/** Recognize an equi-join `L.a = R.b` and return the per-side key positions. */
+function asEquiJoin(
+  on: Expr,
+  columns: PlanColumn[],
+  leftWidth: number,
+): { leftKeyIndex: number; rightKeyIndex: number } | null {
+  if (on.kind !== "compare" || on.op !== "=") return null;
+  if (on.left.kind !== "column" || on.right.kind !== "column") return null;
+  const a = resolveRef(columns, on.left);
+  const b = resolveRef(columns, on.right);
+  const aLeft = a < leftWidth;
+  const bLeft = b < leftWidth;
+  if (aLeft === bLeft) return null; // both sides reference the same input
+  return aLeft
+    ? { leftKeyIndex: a, rightKeyIndex: b - leftWidth }
+    : { leftKeyIndex: b, rightKeyIndex: a - leftWidth };
 }
 
 /**
@@ -93,30 +160,54 @@ export interface PhysDelete {
 export function toPhysical(plan: LogicalPlan, limitHint?: number): PhysicalPlan {
   switch (plan.kind) {
     case "scan":
-      return { op: "SeqScan", table: plan.table, columns: plan.table.columns };
+      return { op: "SeqScan", table: plan.table, columns: planColumns(plan.table, plan.alias) };
     case "indexScan":
       return {
         op: "IndexScan",
         table: plan.table,
-        columns: plan.table.columns,
+        columns: planColumns(plan.table, plan.alias),
         column: plan.column,
         root: plan.root,
         lo: plan.lo,
         hi: plan.hi,
       };
+    case "join": {
+      const left = toPhysical(plan.left);
+      const right = toPhysical(plan.right);
+      const columns = [...left.columns, ...right.columns];
+      const leftWidth = left.columns.length;
+      const eq = asEquiJoin(plan.on, columns, leftWidth);
+      if (eq) {
+        return {
+          op: "HashJoin",
+          joinType: plan.joinType,
+          columns,
+          leftWidth,
+          on: plan.on,
+          leftKeyIndex: eq.leftKeyIndex,
+          rightKeyIndex: eq.rightKeyIndex,
+          left,
+          right,
+        };
+      }
+      return { op: "NestedLoopJoin", joinType: plan.joinType, columns, leftWidth, on: plan.on, left, right };
+    }
     case "filter": {
       const input = toPhysical(plan.input);
       return { op: "Filter", predicate: plan.predicate, columns: input.columns, input };
     }
     case "project": {
       const input = toPhysical(plan.input, limitHint); // Project preserves row count
-      const indices = plan.columns.map((name) => columnIndex({ columns: input.columns }, name));
+      const indices =
+        plan.columns === "*"
+          ? input.columns.map((_, i) => i)
+          : plan.columns.map((ref) => resolveRef(input.columns, ref));
       const columns = indices.map((i) => input.columns[i]!);
       return { op: "Project", columns, indices, input };
     }
     case "sort": {
       const input = toPhysical(plan.input);
-      const sortIndex = columnIndex({ columns: input.columns }, plan.column);
+      const sortIndex = resolveRef(input.columns, plan.column);
       return { op: "Sort", columns: input.columns, sortIndex, dir: plan.dir, limit: limitHint, input };
     }
     case "limit": {
@@ -127,7 +218,7 @@ export function toPhysical(plan: LogicalPlan, limitHint?: number): PhysicalPlan 
       return {
         op: "Insert",
         table: plan.table,
-        columns: plan.table.columns,
+        columns: planColumns(plan.table, plan.table.name),
         rows: plan.rows,
         ...(plan.autoIncrement ? { autoIncrement: plan.autoIncrement } : {}),
       };
@@ -136,19 +227,19 @@ export function toPhysical(plan: LogicalPlan, limitHint?: number): PhysicalPlan 
       return {
         op: "Update",
         table: plan.table,
-        columns: plan.table.columns,
+        columns: planColumns(plan.table, plan.table.name),
         assignments: plan.assignments,
         input,
       };
     }
     case "delete": {
       const input = toPhysical(plan.input);
-      return { op: "Delete", table: plan.table, columns: plan.table.columns, input };
+      return { op: "Delete", table: plan.table, columns: planColumns(plan.table, plan.table.name), input };
     }
   }
 }
 
-function childOf(plan: PhysicalPlan): PhysicalPlan | null {
+function children(plan: PhysicalPlan): PhysicalPlan[] {
   switch (plan.op) {
     case "Filter":
     case "Project":
@@ -156,9 +247,12 @@ function childOf(plan: PhysicalPlan): PhysicalPlan | null {
     case "Limit":
     case "Update":
     case "Delete":
-      return plan.input;
+      return [plan.input];
+    case "NestedLoopJoin":
+    case "HashJoin":
+      return [plan.left, plan.right];
     default:
-      return null;
+      return [];
   }
 }
 
@@ -171,9 +265,13 @@ function rangeLabel(lo: bigint, hi: bigint): string {
 function nodeLabel(plan: PhysicalPlan): string {
   switch (plan.op) {
     case "SeqScan":
-      return `SeqScan ${plan.table.name}`;
+      return `SeqScan ${labelTable(plan.table.name, plan.columns)}`;
     case "IndexScan":
       return `IndexScan ${plan.table.name}.${plan.column} ${rangeLabel(plan.lo, plan.hi)}`;
+    case "NestedLoopJoin":
+      return `NestedLoopJoin (${plan.joinType}) ON ${printExpr(plan.on)}`;
+    case "HashJoin":
+      return `HashJoin (${plan.joinType}) ON ${printExpr(plan.on)}`;
     case "Filter":
       return `Filter ${printExpr(plan.predicate)}`;
     case "Project":
@@ -198,16 +296,20 @@ function nodeLabel(plan: PhysicalPlan): string {
   }
 }
 
+/** Show the alias next to the table name when they differ (`users u`). */
+function labelTable(name: string, columns: PlanColumn[]): string {
+  const alias = columns[0]?.table;
+  return alias && alias !== name ? `${name} ${alias}` : name;
+}
+
 /** Render the operator tree as indented lines, parents above their children. */
 export function explain(plan: PhysicalPlan): string[] {
   const lines: string[] = [];
-  let node: PhysicalPlan | null = plan;
-  let depth = 0;
-  while (node) {
+  const walk = (node: PhysicalPlan, depth: number): void => {
     lines.push(`${"  ".repeat(depth)}${nodeLabel(node)}`);
-    node = childOf(node);
-    depth += 1;
-  }
+    for (const child of children(node)) walk(child, depth + 1);
+  };
+  walk(plan, 0);
   return lines;
 }
 
@@ -218,7 +320,7 @@ export function printExpr(expr: Expr): string {
     case "param":
       return `?${expr.index + 1}`;
     case "column":
-      return expr.name;
+      return expr.table ? `${expr.table}.${expr.name}` : expr.name;
     case "compare":
       return `${printExpr(expr.left)} ${expr.op} ${printExpr(expr.right)}`;
     case "logical":

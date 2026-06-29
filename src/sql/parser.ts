@@ -3,13 +3,18 @@ import type { ColumnType } from "../record/schema.js";
 import type {
   Assignment,
   ColumnDef,
+  ColumnRef,
   CompareOp,
   DeleteStmt,
   Expr,
+  FromClause,
   InsertStmt,
+  JoinClause,
+  JoinType,
   LiteralValue,
   SelectStmt,
   Statement,
+  TableRef,
   UpdateStmt,
   ValueExpr,
 } from "./ast.js";
@@ -279,26 +284,26 @@ class Parser {
   private parseSelect(): SelectStmt {
     this.expectKeyword("SELECT");
 
-    let columns: string[] | "*";
+    let columns: ColumnRef[] | "*";
     if (this.match("punctuation", "*")) {
       columns = "*";
     } else {
-      const list: string[] = [];
+      const list: ColumnRef[] = [];
       do {
-        list.push(this.expectIdentifier("a column name or *"));
+        list.push(this.parseColumnRef());
       } while (this.match("punctuation", ","));
       columns = list;
     }
 
     this.expectKeyword("FROM");
-    const table = this.expectIdentifier("a table name");
+    const from = this.parseFrom();
 
     const where = this.matchKeyword("WHERE") ? this.parseExpr() : null;
 
     let orderBy: SelectStmt["orderBy"] = null;
     if (this.matchKeyword("ORDER")) {
       this.expectKeyword("BY");
-      const column = this.expectIdentifier("a column name");
+      const column = this.parseColumnRef();
       let dir: "ASC" | "DESC" = "ASC";
       if (this.matchKeyword("DESC")) dir = "DESC";
       else this.matchKeyword("ASC"); // optional; ASC is the default
@@ -310,7 +315,52 @@ class Parser {
       limit = this.parseNonNegativeInteger();
     }
 
-    return { kind: "select", columns, table, where, orderBy, limit };
+    return { kind: "select", columns, from, where, orderBy, limit };
+  }
+
+  /** A column reference, optionally qualified by a table/alias (`u.id`). */
+  private parseColumnRef(): ColumnRef {
+    const first = this.expectIdentifier("a column name");
+    if (this.match("punctuation", ".")) {
+      return { table: first, name: this.expectIdentifier('a column name after "."') };
+    }
+    return { table: null, name: first };
+  }
+
+  /** A FROM table with an optional alias (`users u` or `users AS u`). */
+  private parseTableRef(): TableRef {
+    const table = this.expectIdentifier("a table name");
+    if (this.matchKeyword("AS")) return { table, alias: this.expectIdentifier("an alias after AS") };
+    if (this.check("identifier")) return { table, alias: this.advance().value };
+    return { table, alias: null };
+  }
+
+  private parseFrom(): FromClause {
+    const base = this.parseTableRef();
+    const joins: JoinClause[] = [];
+    for (;;) {
+      if (this.match("punctuation", ",")) {
+        // Comma is a cross join; the optional WHERE turns it into an inner join.
+        joins.push({ type: "inner", right: this.parseTableRef(), on: { kind: "literal", value: true } });
+        continue;
+      }
+      let type: JoinType | null = null;
+      if (this.matchKeyword("INNER")) {
+        this.expectKeyword("JOIN");
+        type = "inner";
+      } else if (this.matchKeyword("LEFT")) {
+        this.matchKeyword("OUTER"); // optional
+        this.expectKeyword("JOIN");
+        type = "left";
+      } else if (this.matchKeyword("JOIN")) {
+        type = "inner";
+      }
+      if (type === null) break;
+      const right = this.parseTableRef();
+      this.expectKeyword("ON");
+      joins.push({ type, right, on: this.parseExpr() });
+    }
+    return { base, joins };
   }
 
   private parseDelete(): DeleteStmt {
@@ -395,7 +445,11 @@ class Parser {
       return { kind: "param", index: this.params++ };
     }
     if (this.check("identifier")) {
-      return { kind: "column", name: this.advance().value };
+      const first = this.advance().value;
+      if (this.match("punctuation", ".")) {
+        return { kind: "column", table: first, name: this.expectIdentifier('a column name after "."') };
+      }
+      return { kind: "column", table: null, name: first };
     }
     return { kind: "literal", value: this.parseLiteralValue() };
   }
