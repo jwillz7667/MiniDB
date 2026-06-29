@@ -31,6 +31,7 @@ export function optimize(plan: LogicalPlan, catalog: Catalog): LogicalPlan {
     }
     case "join":
       return { ...plan, left: optimize(plan.left, catalog), right: optimize(plan.right, catalog) };
+    case "aggregate":
     case "project":
     case "sort":
     case "limit":

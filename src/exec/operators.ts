@@ -1,12 +1,12 @@
 import { ExecutionError } from "../errors.js";
 import type { TableMeta } from "../record/catalog.js";
 import type { Value } from "../record/schema.js";
-import { sortCompare } from "../record/value.js";
+import { compareValues, sortCompare } from "../record/value.js";
 import { BTree } from "../storage/btree.js";
 import type { Rid } from "../storage/rid.js";
 import type { Expr, JoinType } from "../sql/ast.js";
 import type { ResolvedAssignment } from "../plan/logical.js";
-import type { PhysicalPlan, PlanColumn } from "../plan/physical.js";
+import type { PhysAgg, PhysicalPlan, PlanColumn } from "../plan/physical.js";
 import type { ExecContext } from "./context.js";
 import { type CompiledExpr, compileExpr, compilePredicate } from "./eval.js";
 import type { ScannedRow } from "./table-store.js";
@@ -212,6 +212,130 @@ class HashJoinOp implements Operator {
   close(): void {
     this.left.close();
     this.buckets.clear();
+  }
+}
+
+// ---- aggregation ----------------------------------------------------------
+
+interface AggState {
+  count: number;
+  sumBig: bigint;
+  sumNum: number;
+  saw: boolean;
+  best: Exclude<Value, null> | null;
+}
+
+const newAggState = (): AggState => ({ count: 0, sumBig: 0n, sumNum: 0, saw: false, best: null });
+
+function stepAgg(agg: PhysAgg, s: AggState, value: Value): void {
+  switch (agg.func) {
+    case "count":
+      if (agg.argIndex < 0 || value !== null) s.count += 1; // COUNT(*) counts all rows
+      return;
+    case "sum":
+      if (value !== null) {
+        s.saw = true;
+        if (agg.outType === "INT") s.sumBig += value as bigint;
+        else s.sumNum += value as number;
+      }
+      return;
+    case "avg":
+      if (value !== null) {
+        s.saw = true;
+        s.count += 1;
+        s.sumNum += Number(value);
+      }
+      return;
+    case "min":
+      if (value !== null && (s.best === null || compareValues(value, s.best) < 0)) s.best = value;
+      return;
+    case "max":
+      if (value !== null && (s.best === null || compareValues(value, s.best) > 0)) s.best = value;
+      return;
+  }
+}
+
+function finalizeAgg(agg: PhysAgg, s: AggState): Value {
+  switch (agg.func) {
+    case "count":
+      return BigInt(s.count);
+    case "sum":
+      return s.saw ? (agg.outType === "INT" ? s.sumBig : s.sumNum) : null;
+    case "avg":
+      return s.count > 0 ? s.sumNum / s.count : null;
+    default: // min / max
+      return s.best;
+  }
+}
+
+/** Composite group key over the group-by values (NULLs form their own group). */
+function groupKey(values: Value[]): string {
+  return values.map((v) => (v === null ? "∅" : joinKey(v))).join("");
+}
+
+const AGG_RID: Rid = { pageNo: 0, slot: 0 };
+
+/**
+ * Hash aggregation: bucket rows by their group-by values, fold each aggregate as
+ * rows arrive, then emit one tuple per group ([group values…, aggregate results…]).
+ * A whole-table aggregate (no GROUP BY) over zero rows still emits a single row
+ * (COUNT 0, others NULL), matching SQL.
+ */
+class AggregateOp implements Operator {
+  private rows: ExecTuple[] = [];
+  private pos = 0;
+
+  constructor(
+    private readonly child: Operator,
+    readonly columns: PlanColumn[],
+    private readonly groupIndices: number[],
+    private readonly aggregates: PhysAgg[],
+  ) {}
+
+  open(): void {
+    this.child.open();
+    const groups = new Map<string, { key: Value[]; states: AggState[] }>();
+    try {
+      for (let t = this.child.next(); t !== null; t = this.child.next()) {
+        const key = this.groupIndices.map((i) => t.values[i]!);
+        const k = groupKey(key);
+        let g = groups.get(k);
+        if (!g) {
+          g = { key, states: this.aggregates.map(newAggState) };
+          groups.set(k, g);
+        }
+        for (let a = 0; a < this.aggregates.length; a++) {
+          const agg = this.aggregates[a]!;
+          stepAgg(agg, g.states[a]!, agg.argIndex < 0 ? null : t.values[agg.argIndex]!);
+        }
+      }
+    } finally {
+      this.child.close();
+    }
+
+    this.rows = [];
+    if (groups.size === 0 && this.groupIndices.length === 0) {
+      this.rows.push(this.makeRow([], this.aggregates.map(newAggState)));
+    } else {
+      for (const g of groups.values()) this.rows.push(this.makeRow(g.key, g.states));
+    }
+    this.pos = 0;
+  }
+
+  private makeRow(key: Value[], states: AggState[]): ExecTuple {
+    return {
+      rowid: 0n,
+      rid: AGG_RID,
+      values: [...key, ...this.aggregates.map((a, i) => finalizeAgg(a, states[i]!))],
+    };
+  }
+
+  next(): ExecTuple | null {
+    return this.pos < this.rows.length ? this.rows[this.pos++]! : null;
+  }
+
+  close(): void {
+    this.rows = [];
   }
 }
 
@@ -526,6 +650,13 @@ export function buildOperator(plan: PhysicalPlan, ctx: ExecContext): Operator {
         plan.leftKeyIndex!,
         plan.rightKeyIndex!,
         plan.columns.length - plan.leftWidth,
+      );
+    case "Aggregate":
+      return new AggregateOp(
+        buildOperator(plan.input, ctx),
+        plan.columns,
+        plan.groupIndices,
+        plan.aggregates,
       );
     case "Filter":
       return new FilterOp(buildOperator(plan.input, ctx), plan.predicate);

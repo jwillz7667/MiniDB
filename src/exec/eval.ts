@@ -63,6 +63,10 @@ export function compileExpr(expr: Expr, columns: PlanColumn[]): CompiledExpr {
       // Binding replaces every placeholder before planning; reaching here means
       // a statement was run without being bound.
       throw new ExecutionError(`unbound parameter ?${expr.index + 1} (use a prepared statement)`);
+    case "call":
+      // Aggregates are pre-computed by the Aggregate operator and referenced as
+      // ordinary columns; one reaching here means it was used outside SELECT/HAVING.
+      throw new ExecutionError(`aggregate "${expr.func}" is not allowed in this expression`);
     case "column": {
       const idx = resolveColumn(columns, expr.table, expr.name);
       return (values) => values[idx]!;

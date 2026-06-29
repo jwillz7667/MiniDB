@@ -18,6 +18,10 @@ const colref = (name: string, table: string | null = null): { table: string | nu
   table,
   name,
 });
+const selitem = (name: string, table: string | null = null): { expr: unknown; alias: string | null } => ({
+  expr: { kind: "column", table, name },
+  alias: null,
+});
 
 const coldef = (name: string, type: ColumnType, nullable: boolean): ColumnDef => ({
   name,
@@ -93,7 +97,7 @@ describe("parser", () => {
     const stmt = parse(
       "SELECT id, name FROM users WHERE id >= 10 ORDER BY name DESC LIMIT 5",
     ) as SelectStmt;
-    expect(stmt.columns).toEqual([colref("id"), colref("name")]);
+    expect(stmt.columns).toEqual([selitem("id"), selitem("name")]);
     expect(stmt.from).toEqual({ base: { table: "users", alias: null }, joins: [] });
     expect(stmt.orderBy).toEqual({ column: colref("name"), dir: "DESC" });
     expect(stmt.limit).toBe(5);
@@ -115,7 +119,7 @@ describe("parser", () => {
     const stmt = parse(
       "SELECT u.id, o.total FROM users u LEFT JOIN orders AS o ON u.id = o.user_id",
     ) as SelectStmt;
-    expect(stmt.columns).toEqual([colref("id", "u"), colref("total", "o")]);
+    expect(stmt.columns).toEqual([selitem("id", "u"), selitem("total", "o")]);
     expect(stmt.from.base).toEqual({ table: "users", alias: "u" });
     expect(stmt.from.joins).toEqual([
       {

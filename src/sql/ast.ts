@@ -12,7 +12,17 @@ export type LogicalOp = "AND" | "OR";
 export type SortDir = "ASC" | "DESC";
 
 /** WHERE-clause expression tree. */
-export type Expr = LiteralExpr | ParamExpr | ColumnExpr | CompareExpr | LogicalExpr;
+export type Expr = LiteralExpr | ParamExpr | ColumnExpr | CallExpr | CompareExpr | LogicalExpr;
+
+/** An aggregate function call: `COUNT(*)`, `SUM(total)`, `MIN(x)`, etc. */
+export interface CallExpr {
+  readonly kind: "call";
+  /** Lowercased function name (count, sum, avg, min, max). */
+  readonly func: string;
+  /** True for `COUNT(*)`; then `arg` is null. */
+  readonly star: boolean;
+  readonly arg: Expr | null;
+}
 
 export interface LiteralExpr {
   readonly kind: "literal";
@@ -126,12 +136,20 @@ export interface FromClause {
   readonly joins: JoinClause[];
 }
 
+/** A SELECT-list entry: an expression (column or aggregate) with optional alias. */
+export interface SelectItem {
+  readonly expr: Expr;
+  readonly alias: string | null;
+}
+
 export interface SelectStmt {
   readonly kind: "select";
-  /** Projected columns, or "*" for every column of every FROM table. */
-  readonly columns: ColumnRef[] | "*";
+  /** Projected items, or "*" for every column of every FROM table. */
+  readonly columns: SelectItem[] | "*";
   readonly from: FromClause;
   readonly where: Expr | null;
+  readonly groupBy: ColumnRef[] | null;
+  readonly having: Expr | null;
   readonly orderBy: OrderBy | null;
   readonly limit: number | null;
 }
