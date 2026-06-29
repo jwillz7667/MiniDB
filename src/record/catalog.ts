@@ -3,6 +3,7 @@ import { CatalogError } from "../errors.js";
 import { BTree } from "../storage/btree.js";
 import type { Heap } from "../storage/heap.js";
 import type { Pager } from "../storage/pager.js";
+import type { Rid } from "../storage/rid.js";
 import type { Tx } from "../storage/tx.js";
 import {
   type Column,
@@ -331,6 +332,87 @@ export class Catalog {
   ): void {
     const row: Value[] = [tableName, columnName, BigInt(root), unique];
     this.heap.insert(tx, this.indexesRoot, serialize(INDEXES_SCHEMA, row));
+  }
+
+  /** Drop a user table: tombstone its catalog rows and forget it in memory. */
+  dropTable(tx: Tx, name: string): void {
+    if (!this.getTable(name)) throw new CatalogError(`no such table: ${name}`);
+    if (isSystemTable(name)) throw new CatalogError(`cannot drop system table "${name}"`);
+    const lower = name.toLowerCase();
+    const matchName = (r: Value[]): boolean => (r[0] as string).toLowerCase() === lower;
+    this.deleteRowsWhere(tx, this.tablesRoot, TABLES_SCHEMA, matchName);
+    this.deleteRowsWhere(tx, this.columnsRoot, COLUMNS_SCHEMA, matchName);
+    this.deleteRowsWhere(tx, this.indexesRoot, INDEXES_SCHEMA, matchName);
+    this.tables.delete(lower);
+    for (let i = this.indexes.length - 1; i >= 0; i--) {
+      if (this.indexes[i]!.tableName.toLowerCase() === lower) this.indexes.splice(i, 1);
+    }
+    // The heap/B+Tree pages the table used are not reclaimed here; VACUUM frees them.
+  }
+
+  /** Drop a secondary index (not one backing a PRIMARY KEY / UNIQUE constraint). */
+  dropIndex(tx: Tx, tableName: string, columnName: string): void {
+    const idx = this.findIndex(tableName, columnName);
+    if (!idx) throw new CatalogError(`no index on ${tableName}(${columnName})`);
+    if (idx.unique) {
+      throw new CatalogError(
+        `cannot drop the index backing a PRIMARY KEY/UNIQUE constraint on ${tableName}(${columnName})`,
+      );
+    }
+    const t = tableName.toLowerCase();
+    const c = columnName.toLowerCase();
+    this.deleteRowsWhere(
+      tx,
+      this.indexesRoot,
+      INDEXES_SCHEMA,
+      (r) =>
+        (r[0] as string).toLowerCase() === t &&
+        (r[1] as string).toLowerCase() === c &&
+        r[3] === false,
+    );
+    const at = this.indexes.indexOf(idx);
+    if (at >= 0) this.indexes.splice(at, 1);
+  }
+
+  /** Append a nullable / defaulted column to an existing table; returns new meta. */
+  addColumn(tx: Tx, tableName: string, col: Column): TableMeta {
+    const meta = this.requireTable(tableName);
+    if (isSystemTable(tableName)) throw new CatalogError(`cannot alter system table "${tableName}"`);
+    if (col.primaryKey || col.unique || col.autoIncrement) {
+      throw new CatalogError("cannot ADD a PRIMARY KEY / UNIQUE / AUTOINCREMENT column");
+    }
+    if (!col.nullable && col.default === undefined) {
+      throw new CatalogError(`ADD COLUMN "${col.name}" must be nullable or have a DEFAULT`);
+    }
+    if (meta.columns.some((c) => c.name.toLowerCase() === col.name.toLowerCase())) {
+      throw new CatalogError(`column "${col.name}" already exists on "${tableName}"`);
+    }
+    validateConstraints(tableName, [...meta.columns, col]); // validates DEFAULT type, etc.
+
+    const ordinal = meta.columns.length;
+    const row: Value[] = [
+      meta.name,
+      col.name,
+      BigInt(typeTag(col.type)),
+      BigInt(ordinal),
+      col.nullable,
+      BigInt(flagsOf(col)),
+      col.default !== undefined ? serialize(defaultSchema(col.type), [col.default]) : null,
+    ];
+    this.heap.insert(tx, this.columnsRoot, serialize(COLUMNS_SCHEMA, row));
+
+    const columns = [...meta.columns, col];
+    const newMeta: TableMeta = { ...meta, columns, schema: makeSchema(columns) };
+    this.tables.set(tableName.toLowerCase(), newMeta);
+    return newMeta;
+  }
+
+  private deleteRowsWhere(tx: Tx, root: number, schema: Schema, pred: (r: Value[]) => boolean): void {
+    const rids: Rid[] = [];
+    for (const rec of this.heap.scan(tx, root)) {
+      if (pred(deserialize(schema, rec.bytes))) rids.push(rec.rid);
+    }
+    for (const rid of rids) this.heap.delete(tx, rid);
   }
 
   getTable(name: string): TableMeta | undefined {

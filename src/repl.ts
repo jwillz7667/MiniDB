@@ -144,6 +144,15 @@ function printResult(result: ExecResult): void {
     case "createIndex":
       process.stdout.write(`created index on ${result.table}(${result.column})\n`);
       return;
+    case "dropTable":
+      process.stdout.write(`dropped table ${result.table}\n`);
+      return;
+    case "dropIndex":
+      process.stdout.write(`dropped index on ${result.table}(${result.column})\n`);
+      return;
+    case "alterTable":
+      process.stdout.write(`added column ${result.table}.${result.column}\n`);
+      return;
     case "explain":
       process.stdout.write(`${result.lines.join("\n")}\n`);
       return;

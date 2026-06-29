@@ -3,6 +3,7 @@ import { renameSync, rmSync } from "node:fs";
 import { INVALID_PAGE } from "./constants.js";
 import { reconstructCreateIndex, reconstructCreateTable } from "./ddl.js";
 import { TransactionError } from "./errors.js";
+import { valueToLiteral } from "./record/value.js";
 import { DEFAULT_MAX_SORT_ROWS, RowIdAllocator, type ExecContext } from "./exec/context.js";
 import { Executor, type QueryResult } from "./exec/executor.js";
 import { TableStore } from "./exec/table-store.js";
@@ -37,6 +38,20 @@ export type ExecResult =
   | { readonly type: "commit" }
   | { readonly type: "rollback" }
   | { readonly type: "vacuum"; readonly pagesBefore: number; readonly pagesAfter: number };
+
+/** Statements that change schema; disallowed inside an explicit transaction. */
+function isDDL(stmt: Statement): boolean {
+  switch (stmt.kind) {
+    case "createTable":
+    case "createIndex":
+    case "dropTable":
+    case "dropIndex":
+    case "alterTable":
+      return true;
+    default:
+      return false;
+  }
+}
 
 /** The per-open engine components, grouped so VACUUM can rebuild them in place. */
 interface Engine {
@@ -177,7 +192,7 @@ export class Database {
       return new Executor(this.context(this.engine.readTx), this.engine.catalog).run(stmt);
     }
     if (this.current) {
-      if (stmt.kind === "createTable" || stmt.kind === "createIndex") {
+      if (isDDL(stmt)) {
         throw new TransactionError("DDL is not allowed inside an explicit transaction");
       }
       return this.execute(this.current, stmt);
@@ -289,6 +304,32 @@ export class Database {
         ? this.engine.recovery.maxTxid + 1n
         : this.engine.pager.getNextTxid();
     return { pagesBefore, pagesAfter: this.engine.pager.pageCount() };
+  }
+
+  /**
+   * Write a consistent, compacted copy of this database to `targetPath` (an
+   * online logical backup). The copy is a standalone, ready-to-open database.
+   */
+  backup(targetPath: string): void {
+    if (this.current) throw new TransactionError("cannot back up inside a transaction");
+    this.checkpoint();
+    this.copyInto(targetPath);
+  }
+
+  /** Serialize the whole database (schema + data) as runnable SQL (for export). */
+  dump(): string {
+    const lines: string[] = [];
+    for (const table of this.engine.catalog.listTables()) {
+      lines.push(`${reconstructCreateTable(table)};`);
+      for (const index of this.engine.catalog.getIndexes(table.name)) {
+        if (!index.unique) lines.push(`${reconstructCreateIndex(table.name, index.columnName)};`);
+      }
+      const cols = table.columns.map((c) => c.name).join(", ");
+      for (const row of this.engine.store.scan(this.engine.readTx, table)) {
+        lines.push(`INSERT INTO ${table.name} (${cols}) VALUES (${row.values.map(valueToLiteral).join(", ")});`);
+      }
+    }
+    return lines.length ? `${lines.join("\n")}\n` : "";
   }
 
   /** Build a compacted copy of this database at `targetPath` (live data only). */

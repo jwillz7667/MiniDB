@@ -21,6 +21,12 @@ export interface Token {
 /** Reserved words, stored uppercased; matched case-insensitively by the lexer. */
 export const KEYWORDS: ReadonlySet<string> = new Set([
   "CREATE",
+  "DROP",
+  "ALTER",
+  "ADD",
+  "COLUMN",
+  "IF",
+  "EXISTS",
   "TABLE",
   "INDEX",
   "ON",

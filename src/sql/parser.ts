@@ -164,6 +164,10 @@ class Parser {
     switch (t.value) {
       case "CREATE":
         return this.parseCreate();
+      case "DROP":
+        return this.parseDrop();
+      case "ALTER":
+        return this.parseAlter();
       case "INSERT":
         return this.parseInsert();
       case "SELECT":
@@ -255,6 +259,36 @@ class Parser {
     const column = this.expectIdentifier("a column name");
     this.expect("punctuation", ")", '")" after the indexed column');
     return { kind: "createIndex", table, column };
+  }
+
+  private parseDrop(): Statement {
+    this.expectKeyword("DROP");
+    if (this.matchKeyword("TABLE")) {
+      let ifExists = false;
+      if (this.matchKeyword("IF")) {
+        this.expectKeyword("EXISTS");
+        ifExists = true;
+      }
+      return { kind: "dropTable", table: this.expectIdentifier("a table name"), ifExists };
+    }
+    if (this.matchKeyword("INDEX")) {
+      this.expectKeyword("ON");
+      const table = this.expectIdentifier("a table name");
+      this.expect("punctuation", "(", '"(" before the indexed column');
+      const column = this.expectIdentifier("a column name");
+      this.expect("punctuation", ")", '")" after the indexed column');
+      return { kind: "dropIndex", table, column };
+    }
+    throw this.error("expected TABLE or INDEX after DROP");
+  }
+
+  private parseAlter(): Statement {
+    this.expectKeyword("ALTER");
+    this.expectKeyword("TABLE");
+    const table = this.expectIdentifier("a table name");
+    this.expectKeyword("ADD");
+    this.matchKeyword("COLUMN"); // optional
+    return { kind: "alterTable", table, column: this.parseColumnDef() };
   }
 
   private parseInsert(): InsertStmt {

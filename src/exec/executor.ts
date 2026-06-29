@@ -3,9 +3,12 @@ import type { Catalog } from "../record/catalog.js";
 import { type Column, columnIndex, type Value } from "../record/schema.js";
 import { BTree } from "../storage/btree.js";
 import type {
+  AlterTableStmt,
   CreateIndexStmt,
   CreateTableStmt,
   DeleteStmt,
+  DropIndexStmt,
+  DropTableStmt,
   ExplainStmt,
   InsertStmt,
   SelectStmt,
@@ -36,6 +39,9 @@ export type QueryResult =
   | { readonly type: "delete"; readonly rowCount: number }
   | { readonly type: "createTable"; readonly table: string }
   | { readonly type: "createIndex"; readonly table: string; readonly column: string }
+  | { readonly type: "dropTable"; readonly table: string }
+  | { readonly type: "dropIndex"; readonly table: string; readonly column: string }
+  | { readonly type: "alterTable"; readonly table: string; readonly column: string }
   | { readonly type: "explain"; readonly lines: string[] };
 
 /**
@@ -56,6 +62,12 @@ export class Executor {
         return this.createTable(stmt);
       case "createIndex":
         return this.createIndex(stmt);
+      case "dropTable":
+        return this.dropTable(stmt);
+      case "dropIndex":
+        return this.dropIndex(stmt);
+      case "alterTable":
+        return this.alterTable(stmt);
       case "select":
         return this.select(stmt);
       case "insert":
@@ -101,6 +113,41 @@ export class Executor {
     }
     this.catalog.createIndex(this.ctx.tx, table.name, col.name, root);
     return { type: "createIndex", table: table.name, column: col.name };
+  }
+
+  private dropTable(stmt: DropTableStmt): QueryResult {
+    if (!(stmt.ifExists && !this.catalog.getTable(stmt.table))) {
+      this.catalog.dropTable(this.ctx.tx, stmt.table);
+    }
+    return { type: "dropTable", table: stmt.table };
+  }
+
+  private dropIndex(stmt: DropIndexStmt): QueryResult {
+    this.catalog.dropIndex(this.ctx.tx, stmt.table, stmt.column);
+    return { type: "dropIndex", table: stmt.table, column: stmt.column };
+  }
+
+  private alterTable(stmt: AlterTableStmt): QueryResult {
+    const meta = this.catalog.requireTable(stmt.table);
+    // Read existing rows under the OLD schema before the catalog changes, then
+    // rewrite each with the new column's DEFAULT (or NULL) appended.
+    const oldRows = [...this.ctx.store.scan(this.ctx.tx, meta)];
+    const d = stmt.column;
+    const col: Column = {
+      name: d.name,
+      type: d.type,
+      nullable: d.nullable,
+      primaryKey: d.primaryKey,
+      unique: d.unique,
+      autoIncrement: d.autoIncrement,
+      ...(d.default !== undefined ? { default: d.default } : {}),
+    };
+    const newMeta = this.catalog.addColumn(this.ctx.tx, stmt.table, col);
+    const fill = col.default ?? null;
+    for (const row of oldRows) {
+      this.ctx.store.updateRow(this.ctx.tx, newMeta, row, [...row.values, fill]);
+    }
+    return { type: "alterTable", table: stmt.table, column: col.name };
   }
 
   private select(stmt: SelectStmt): QueryResult {
