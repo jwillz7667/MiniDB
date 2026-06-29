@@ -1,4 +1,7 @@
+import { renameSync, rmSync } from "node:fs";
+
 import { INVALID_PAGE } from "./constants.js";
+import { reconstructCreateIndex, reconstructCreateTable } from "./ddl.js";
 import { TransactionError } from "./errors.js";
 import { DEFAULT_MAX_SORT_ROWS, RowIdAllocator, type ExecContext } from "./exec/context.js";
 import { Executor, type QueryResult } from "./exec/executor.js";
@@ -32,7 +35,21 @@ export type ExecResult =
   | QueryResult
   | { readonly type: "begin" }
   | { readonly type: "commit" }
-  | { readonly type: "rollback" };
+  | { readonly type: "rollback" }
+  | { readonly type: "vacuum"; readonly pagesBefore: number; readonly pagesAfter: number };
+
+/** The per-open engine components, grouped so VACUUM can rebuild them in place. */
+interface Engine {
+  readonly pager: Pager;
+  readonly pool: BufferPool;
+  readonly wal: Wal;
+  readonly catalog: Catalog;
+  readonly store: TableStore;
+  readonly heap: Heap;
+  readonly rowids: RowIdAllocator;
+  readonly readTx: DirectTx;
+  readonly recovery: RecoveryStats;
+}
 
 /**
  * The top-level database: a durable, single-file SQL engine. Ties together the
@@ -41,45 +58,38 @@ export type ExecResult =
  * in an autocommit transaction unless wrapped in BEGIN/COMMIT/ROLLBACK.
  */
 export class Database {
+  private engine: Engine;
   private current: WalTx | null = null;
   private nextTxid: bigint;
   private readonly active = new Set<bigint>();
-  private lastRecovery: RecoveryStats;
 
   private constructor(
-    private readonly pager: Pager,
-    private readonly pool: BufferPool,
-    private readonly wal: Wal,
-    private readonly catalog: Catalog,
-    private readonly store: TableStore,
-    private readonly heap: Heap,
-    private readonly rowids: RowIdAllocator,
-    private readonly readTx: DirectTx,
+    engine: Engine,
+    private readonly path: string,
     private readonly lock: FileLock,
+    private readonly options: DatabaseOptions,
     private readonly maxSortRows: number,
-    recovery: RecoveryStats,
   ) {
-    this.lastRecovery = recovery;
+    this.engine = engine;
     this.nextTxid =
-      recovery.maxTxid > 0n ? recovery.maxTxid + 1n : pager.getNextTxid();
+      engine.recovery.maxTxid > 0n ? engine.recovery.maxTxid + 1n : engine.pager.getNextTxid();
   }
 
   static open(path: string, options: DatabaseOptions = {}): Database {
     // Refuse to open a file another live instance holds (would corrupt it).
     const lock = FileLock.acquire(path);
     try {
-      return Database.openLocked(path, options, lock);
+      const engine = Database.buildEngine(path, options);
+      return new Database(engine, path, lock, options, options.maxSortRows ?? DEFAULT_MAX_SORT_ROWS);
     } catch (err) {
       lock.release();
       throw err;
     }
   }
 
-  private static openLocked(path: string, options: DatabaseOptions, lock: FileLock): Database {
+  /** Open + recover the engine for `path`. Closes its fds if anything throws. */
+  private static buildEngine(path: string, options: DatabaseOptions): Engine {
     const durability = new Durability(options.synchronous ?? "full");
-    // Close the file descriptors if anything below throws before the returned
-    // Database (which owns and closes them) is constructed — otherwise a failed
-    // open on a corrupt file leaks fds until EMFILE.
     const pager = Pager.open(path, durability);
     let wal: Wal | undefined;
     try {
@@ -110,20 +120,7 @@ export class Database {
       }
 
       const store = new TableStore(catalog, heap);
-      const rowids = new RowIdAllocator();
-      return new Database(
-        pager,
-        pool,
-        wal,
-        catalog,
-        store,
-        heap,
-        rowids,
-        new DirectTx(pool),
-        lock,
-        options.maxSortRows ?? DEFAULT_MAX_SORT_ROWS,
-        recovery,
-      );
+      return { pager, pool, wal, catalog, store, heap, rowids: new RowIdAllocator(), readTx: new DirectTx(pool), recovery };
     } catch (err) {
       wal?.close();
       pager.close();
@@ -170,18 +167,14 @@ export class Database {
     if (stmt.kind === "begin" || stmt.kind === "commit" || stmt.kind === "rollback") {
       return this.control(stmt.kind);
     }
+    if (stmt.kind === "vacuum") {
+      return { type: "vacuum", ...this.vacuum() };
+    }
     // Read-only statements touch no pages durably, so they skip the transaction
     // machinery entirely — no BEGIN/COMMIT, no fsync. They still read through the
     // shared buffer pool, so an open transaction's uncommitted writes are visible.
     if (stmt.kind === "select" || stmt.kind === "explain") {
-      const ctx: ExecContext = {
-        tx: this.readTx,
-        catalog: this.catalog,
-        store: this.store,
-        rowids: this.rowids,
-        maxSortRows: this.maxSortRows,
-      };
-      return new Executor(ctx, this.catalog).run(stmt);
+      return new Executor(this.context(this.engine.readTx), this.engine.catalog).run(stmt);
     }
     if (this.current) {
       if (stmt.kind === "createTable" || stmt.kind === "createIndex") {
@@ -214,42 +207,45 @@ export class Database {
     return { type: kind };
   }
 
-  private execute(tx: WalTx, stmt: Statement): QueryResult {
-    const ctx: ExecContext = {
+  private context(tx: DirectTx | WalTx): ExecContext {
+    return {
       tx,
-      catalog: this.catalog,
-      store: this.store,
-      rowids: this.rowids,
+      catalog: this.engine.catalog,
+      store: this.engine.store,
+      rowids: this.engine.rowids,
       maxSortRows: this.maxSortRows,
     };
-    return new Executor(ctx, this.catalog).run(stmt);
+  }
+
+  private execute(tx: WalTx, stmt: Statement): QueryResult {
+    return new Executor(this.context(tx), this.engine.catalog).run(stmt);
   }
 
   private begin(): WalTx {
     const txid = this.nextTxid;
     this.nextTxid += 1n;
-    this.wal.append({ type: "begin", txid });
+    this.engine.wal.append({ type: "begin", txid });
     this.active.add(txid);
-    return new WalTx(this.pool, this.wal, txid);
+    return new WalTx(this.engine.pool, this.engine.wal, txid);
   }
 
   private commit(tx: WalTx): void {
-    this.wal.append({ type: "commit", txid: tx.txid });
-    this.wal.flushForCommit(); // commit is durable once its record is flushed
+    this.engine.wal.append({ type: "commit", txid: tx.txid });
+    this.engine.wal.flushForCommit(); // commit is durable once its record is flushed
     this.active.delete(tx.txid);
     tx.markFinished();
   }
 
   private rollback(tx: WalTx): void {
     tx.applyUndo();
-    this.wal.append({ type: "abort", txid: tx.txid });
-    this.wal.flushForCommit();
+    this.engine.wal.append({ type: "abort", txid: tx.txid });
+    this.engine.wal.flushForCommit();
     this.active.delete(tx.txid);
     tx.markFinished();
     // The undo may have shrunk heap chains and rewound rowid/btree state, so
     // drop in-memory hints that could now point at orphaned pages.
-    this.rowids.reset();
-    this.heap.resetCache();
+    this.engine.rowids.reset();
+    this.engine.heap.resetCache();
   }
 
   /**
@@ -257,29 +253,84 @@ export class Database {
    * recovery can start redo from here instead of the beginning of the log.
    */
   checkpoint(): void {
-    this.pool.flushAll(); // honors the write-ahead rule via the flush hook
-    this.wal.append({ type: "checkpoint", active: [...this.active] });
-    this.wal.flush(); // a checkpoint must be durable, so a hard barrier
-    this.pager.setNextTxid(this.nextTxid);
+    this.engine.pool.flushAll(); // honors the write-ahead rule via the flush hook
+    this.engine.wal.append({ type: "checkpoint", active: [...this.active] });
+    this.engine.wal.flush(); // a checkpoint must be durable, so a hard barrier
+    this.engine.pager.setNextTxid(this.nextTxid);
+  }
+
+  /**
+   * Rebuild the database into a fresh, compacted file and swap it in, reclaiming
+   * space held by tombstoned rows, dead overflow chains, and fragmentation. Live
+   * data and schema (constraints, indexes, defaults) are preserved; internal
+   * rowids are reassigned. Cannot run inside an explicit transaction.
+   */
+  vacuum(): { pagesBefore: number; pagesAfter: number } {
+    if (this.current) throw new TransactionError("cannot VACUUM inside a transaction");
+    this.checkpoint();
+    const pagesBefore = this.engine.pager.pageCount();
+
+    const tmp = `${this.path}.vacuum-${process.pid}`;
+    for (const suffix of ["", "-wal", "-lock"]) rmSync(`${tmp}${suffix}`, { force: true });
+    this.copyInto(tmp);
+
+    // Close the old engine (keeping our lock on `path`), put the compacted file
+    // in its place, drop the now-stale WAL, and re-open in place.
+    this.engine.wal.close();
+    this.engine.pager.close();
+    renameSync(tmp, this.path);
+    rmSync(`${tmp}-wal`, { force: true });
+    rmSync(`${tmp}-lock`, { force: true });
+    rmSync(`${this.path}-wal`, { force: true });
+
+    this.engine = Database.buildEngine(this.path, this.options);
+    this.nextTxid =
+      this.engine.recovery.maxTxid > 0n
+        ? this.engine.recovery.maxTxid + 1n
+        : this.engine.pager.getNextTxid();
+    return { pagesBefore, pagesAfter: this.engine.pager.pageCount() };
+  }
+
+  /** Build a compacted copy of this database at `targetPath` (live data only). */
+  private copyInto(targetPath: string): void {
+    const dest = Database.open(targetPath, this.options);
+    try {
+      for (const table of this.engine.catalog.listTables()) {
+        dest.exec(reconstructCreateTable(table));
+        for (const index of this.engine.catalog.getIndexes(table.name)) {
+          if (!index.unique) dest.exec(reconstructCreateIndex(table.name, index.columnName));
+        }
+        const cols = table.columns.map((c) => c.name);
+        const insert = dest.prepare(
+          `INSERT INTO ${table.name} (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`,
+        );
+        for (const row of this.engine.store.scan(this.engine.readTx, table)) {
+          insert.run(...row.values);
+        }
+      }
+      dest.checkpoint();
+    } finally {
+      dest.close();
+    }
   }
 
   /** Stats from the WAL replay performed when this database was opened. */
   recoveryStats(): RecoveryStats {
-    return this.lastRecovery;
+    return this.engine.recovery;
   }
 
   /** Names of user tables (system tables excluded). */
   tableNames(): string[] {
-    return this.catalog.listTables().map((t) => t.name);
+    return this.engine.catalog.listTables().map((t) => t.name);
   }
 
   tableMeta(name: string): TableMeta | undefined {
-    return this.catalog.getTable(name);
+    return this.engine.catalog.getTable(name);
   }
 
   /** Buffer-pool cache hit rate since open (or last reset). */
   hitRate(): number {
-    return this.pool.hitRate();
+    return this.engine.pool.hitRate();
   }
 
   /** Cleanly close: roll back any open transaction, checkpoint, and release files. */
@@ -289,8 +340,8 @@ export class Database {
       this.current = null;
     }
     this.checkpoint();
-    this.wal.close();
-    this.pager.close();
+    this.engine.wal.close();
+    this.engine.pager.close();
     this.lock.release();
   }
 }

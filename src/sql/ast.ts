@@ -83,6 +83,7 @@ export type Statement =
   | UpdateStmt
   | DeleteStmt
   | ExplainStmt
+  | VacuumStmt
   | TxnStmt;
 
 export interface CreateTableStmt {
@@ -177,6 +178,11 @@ export interface UpdateStmt {
 export interface ExplainStmt {
   readonly kind: "explain";
   readonly statement: SelectStmt | InsertStmt | UpdateStmt | DeleteStmt;
+}
+
+/** Rebuild the database file, reclaiming dead space. */
+export interface VacuumStmt {
+  readonly kind: "vacuum";
 }
 
 export interface TxnStmt {

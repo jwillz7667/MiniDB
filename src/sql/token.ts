@@ -66,4 +66,5 @@ export const KEYWORDS: ReadonlySet<string> = new Set([
   "BEGIN",
   "COMMIT",
   "ROLLBACK",
+  "VACUUM",
 ]);
