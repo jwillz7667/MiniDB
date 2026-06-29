@@ -68,6 +68,7 @@ function rewrite(stmt: Statement, params: readonly LiteralValue[]): Statement {
       return rewriteExplain(stmt, params);
     case "createTable":
     case "createIndex":
+    case "vacuum":
     case "begin":
     case "commit":
     case "rollback":

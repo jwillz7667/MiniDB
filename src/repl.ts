@@ -152,6 +152,9 @@ function printResult(result: ExecResult): void {
     case "rollback":
       process.stdout.write(`${result.type}\n`);
       return;
+    case "vacuum":
+      process.stdout.write(`vacuum: ${result.pagesBefore} -> ${result.pagesAfter} pages\n`);
+      return;
   }
 }
 

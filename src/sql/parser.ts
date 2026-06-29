@@ -183,6 +183,9 @@ class Parser {
       case "ROLLBACK":
         this.advance();
         return { kind: "rollback" };
+      case "VACUUM":
+        this.advance();
+        return { kind: "vacuum" };
       default:
         throw this.error("expected a SQL statement");
     }
