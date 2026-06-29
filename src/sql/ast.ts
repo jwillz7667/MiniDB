@@ -34,6 +34,8 @@ export type ValueExpr = LiteralExpr | ParamExpr;
 
 export interface ColumnExpr {
   readonly kind: "column";
+  /** Optional table/alias qualifier, e.g. the `u` in `u.id`. */
+  readonly table: string | null;
   readonly name: string;
 }
 
@@ -94,16 +96,41 @@ export interface InsertStmt {
   readonly rows: ValueExpr[][];
 }
 
+/** A (possibly qualified) column reference: the `u.id` or `id` in a clause. */
+export interface ColumnRef {
+  readonly table: string | null;
+  readonly name: string;
+}
+
 export interface OrderBy {
-  readonly column: string;
+  readonly column: ColumnRef;
   readonly dir: SortDir;
+}
+
+/** A table in the FROM clause with an optional alias (`users u` / `users AS u`). */
+export interface TableRef {
+  readonly table: string;
+  readonly alias: string | null;
+}
+
+export type JoinType = "inner" | "left";
+
+export interface JoinClause {
+  readonly type: JoinType;
+  readonly right: TableRef;
+  readonly on: Expr;
+}
+
+export interface FromClause {
+  readonly base: TableRef;
+  readonly joins: JoinClause[];
 }
 
 export interface SelectStmt {
   readonly kind: "select";
-  /** Projected column names, or "*" for all. */
-  readonly columns: string[] | "*";
-  readonly table: string;
+  /** Projected columns, or "*" for every column of every FROM table. */
+  readonly columns: ColumnRef[] | "*";
+  readonly from: FromClause;
   readonly where: Expr | null;
   readonly orderBy: OrderBy | null;
   readonly limit: number | null;

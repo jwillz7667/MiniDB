@@ -76,7 +76,12 @@ function rewrite(stmt: Statement, params: readonly LiteralValue[]): Statement {
 }
 
 function rewriteSelect(stmt: SelectStmt, params: readonly LiteralValue[]): SelectStmt {
-  return stmt.where === null ? stmt : { ...stmt, where: bindExpr(stmt.where, params) };
+  const joins = stmt.from.joins.map((j) => ({ ...j, on: bindExpr(j.on, params) }));
+  return {
+    ...stmt,
+    from: { ...stmt.from, joins },
+    where: stmt.where === null ? null : bindExpr(stmt.where, params),
+  };
 }
 
 function rewriteDelete(stmt: DeleteStmt, params: readonly LiteralValue[]): DeleteStmt {
