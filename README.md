@@ -37,21 +37,24 @@ Everything lives in **one data file** of fixed-size 4 KB pages (plus one WAL fil
 SQLite. Dependencies flow strictly downward:
 
 ```text
-        repl / bench / db (facade)
+    index / async / kysely / repl / db (facade)
                   │
-        exec   Volcano operators + executor (SeqScan, IndexScan, Filter,
-                  │                            Project, Sort, Limit, Insert, Delete)
+        exec   Volcano operators + executor (SeqScan, IndexScan, NestedLoop/Hash
+                  │            Join, Aggregate, Filter, Project, Sort, Limit,
+                  │            Insert, Update, Delete)
         plan   logical plan → optimizer → physical plan   (+ EXPLAIN)
                   │
-        sql    lexer → recursive-descent parser → AST
+        sql    lexer → recursive-descent parser → AST → bind (params)
                   │
         record schema · tuple (de)serialization · self-describing catalog
                   │
-        storage  B+Tree   ·   slotted heap pages        txn  WAL · recovery · MVCC
-                  │                                       │
+        storage  B+Tree · slotted heap · overflow pages    txn  WAL · recovery · MVCC
+                  │                                          │
         bufferpool  clock eviction · pin/dirty · write-ahead hook
                   │
-        pager   raw 4 KB pages · fsync · file growth
+        pager   raw 4 KB pages · per-page CRC32 · file growth
+                  │
+        vfs     pluggable backend — filesystem (default) or in-memory
 ```
 
 The layering is enforced by discipline (and reflected in the import graph): the domain code
@@ -61,24 +64,36 @@ transparently.
 
 ### Capabilities
 
-- **SQL**: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT … WHERE … ORDER BY … LIMIT`,
-  `DELETE … WHERE`, `EXPLAIN`, and `BEGIN` / `COMMIT` / `ROLLBACK`.
-- **Types**: `INT` (signed 64-bit, carried as `bigint` end-to-end so nothing is rounded),
-  `TEXT` (length-prefixed UTF-8), `BOOL`. NULLs tracked by a per-tuple null bitmap.
-- **Storage**: on-disk B+Tree (point lookups + ordered range scans), slotted heap pages,
-  a buffer pool with clock (second-chance) eviction.
-- **Durability**: write-ahead logging with the STEAL + NO-FORCE policy and ARIES-lite redo /
-  undo recovery (with logged compensation records), checkpointing, and CRC32 on both log
-  records and **every data page**, so torn writes and bit-rot are detected, not silently
-  served. Configurable sync modes (`full` / `normal` / `off`) and a directory fsync on
-  create.
-- **Concurrency**: MVCC with snapshot isolation — versioned tuples (`xmin`/`xmax`), per-
-  transaction snapshots, and first-updater-wins conflict detection. A PID lock keeps two
-  instances from opening (and corrupting) the same file.
-- **Resource safety**: `ORDER BY … LIMIT n` keeps only a bounded top-N; an unbounded
-  `ORDER BY` is capped and fails safe instead of exhausting memory.
-- **Optimizer**: predicate pushdown into the access method and index selection, both visible
-  in `EXPLAIN`.
+- **SQL**: `CREATE`/`DROP`/`ALTER TABLE`, `CREATE`/`DROP INDEX`, `INSERT`, `UPDATE`,
+  `DELETE`, `SELECT` with `JOIN` (inner/left), `WHERE`, `GROUP BY`, `HAVING`,
+  `ORDER BY`, `LIMIT`, aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), `EXPLAIN`,
+  `VACUUM`, and `BEGIN` / `COMMIT` / `ROLLBACK`. Table aliases and qualified
+  columns (`u.id`); double-quoted identifiers.
+- **Prepared statements**: `?` placeholders bound as data (no string-building, no
+  injection); a better-sqlite3-style API (`all`/`get`/`values`/`pluck`/`run`).
+- **Types**: `INT` (signed 64-bit `bigint`, never rounded), `REAL` (float64), `TEXT`
+  (UTF-8), `BOOL`, `BLOB` (`Buffer`), `DATETIME` (`Date`). Values larger than a page
+  spill to **overflow pages** (multi-MB TEXT/BLOB). NULLs via a per-tuple null bitmap.
+- **Constraints**: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `AUTOINCREMENT`,
+  enforced and persisted in a self-describing catalog.
+- **Storage**: on-disk B+Tree (point lookups + ordered range scans), slotted heap
+  pages, clock-eviction buffer pool, nested-loop **and hash** joins, hash aggregation.
+- **Durability**: write-ahead logging (STEAL + NO-FORCE), ARIES-lite redo/undo recovery
+  with logged compensation records, checkpointing, CRC32 on every log record **and
+  every data page**, sync modes (`full`/`normal`/`off`), and a directory fsync on create.
+- **Pluggable storage**: the same engine runs over the filesystem (default) or entirely
+  in RAM via `:memory:` — **zero native dependencies**, runs anywhere JS runs.
+- **Operations**: `VACUUM` (rebuild + reclaim space), online `backup()`, SQL `dump()`,
+  and a single-writer PID lock.
+- **Adapters**: a Promise-based `AsyncDatabase`, and a dialect for the **Kysely**
+  type-safe query builder (`minidb/kysely`).
+- **Optimizer**: predicate pushdown + index selection + hash-vs-nested-loop join choice,
+  all visible in `EXPLAIN`.
+
+> **MVCC note:** the engine ships a unit-tested snapshot-isolation layer
+> (versioned tuples, per-transaction snapshots, first-updater-wins), but it is not
+> yet wired into the SQL executor; the SQL path is single-writer with autocommit /
+> `BEGIN`…`COMMIT`. Wiring it in is the next big step.
 
 ---
 
@@ -86,7 +101,7 @@ transparently.
 
 ```bash
 pnpm install
-pnpm test          # 117 tests, incl. a power-loss crash fuzzer
+pnpm test          # 217 tests, incl. a power-loss crash fuzzer
 pnpm repl          # interactive SQL shell
 ```
 
@@ -103,6 +118,79 @@ minidb> SELECT id, name FROM users WHERE age = 30 ORDER BY name;
 +----+------+
 2 rows
 ```
+
+### As a library (TypeScript)
+
+```bash
+npm install minidb        # zero runtime dependencies
+```
+
+```ts
+import { Database } from "minidb";
+
+const db = Database.open("app.minidb"); // or ":memory:" for an in-RAM database
+
+db.exec(`
+  CREATE TABLE users (
+    id    INT PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    name  TEXT NOT NULL,
+    score REAL DEFAULT 0
+  )
+`);
+
+// Prepared statements bind values as data — injection-safe, no string building.
+const insert = db.prepare("INSERT INTO users (email, name, score) VALUES (?, ?, ?)");
+insert.run("ann@example.com", "Ann", 9.5);
+insert.run("bob@example.com", "Bob", 7.0);
+
+const top = db.prepare("SELECT name, score FROM users WHERE score >= ? ORDER BY score DESC");
+top.all(8); // [{ name: "Ann", score: 9.5 }]   (INT columns come back as bigint)
+
+db.close();
+```
+
+**Transactions** (a thrown error is rolled back automatically with the async helper):
+
+```ts
+import { AsyncDatabase } from "minidb";
+
+const db = await AsyncDatabase.open("app.minidb");
+await db.transaction(async (tx) => {
+  await tx.run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [100, 1]);
+  await tx.run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [100, 2]);
+}); // COMMIT on success, ROLLBACK if the callback throws
+```
+
+**In-memory** (no filesystem, no native binary — works in tests, edge/serverless, bundled CLIs):
+
+```ts
+import { Database, MemoryVfs } from "minidb";
+
+const db = Database.open(":memory:");           // fresh RAM store
+const shared = new MemoryVfs();                 // or share one across reopens
+const db2 = Database.open("app.db", { vfs: shared });
+```
+
+**With [Kysely](https://kysely.dev)** (the type-safe query builder — `npm install kysely`):
+
+```ts
+import { Kysely } from "kysely";
+import { Database } from "minidb";
+import { MinidbDialect } from "minidb/kysely";
+
+interface DB { users: { id: bigint; name: string; age: bigint } }
+
+const minidb = Database.open("app.minidb");
+const db = new Kysely<DB>({ dialect: new MinidbDialect({ database: minidb }) });
+
+await db.selectFrom("users").select(["name"]).where("age", ">=", 18n).execute();
+```
+
+**Operations**: `db.vacuum()` rebuilds and reclaims space; `db.backup("copy.minidb")` makes a
+consistent online copy; `db.dump()` exports the whole database as runnable SQL.
+
+Runnable examples live in [`examples/`](examples/) (`pnpm tsx examples/quickstart.ts`).
 
 ### The optimizer, made visible
 
@@ -209,20 +297,26 @@ pool (6 MB), 90% of reads into the hottest 10% → **99.2% hit rate**.
 
 ```text
 src/
+  index.ts                public API barrel (the npm entrypoint)
   constants.ts            PAGE_SIZE and every persisted magic number / tag (defined once)
   errors.ts               typed error hierarchy
-  storage/                pager, bufferpool, slotted page, heap, B+Tree, Tx abstraction
+  storage/                pager, bufferpool, slotted page, heap, B+Tree, overflow,
+                          Tx abstraction, durability, lock, vfs + memory-vfs
   record/                 schema, tuple (de)serialization, value semantics, catalog
-  sql/                    token, lexer, AST, recursive-descent parser
+  sql/                    token, lexer, AST, parser, parameter binding
   plan/                   logical plan, optimizer, physical plan + EXPLAIN
-  exec/                   Volcano operators, executor, table store, expression compiler
+  exec/                   Volcano operators (incl. joins/aggregation), executor, table store
   txn/                    WAL, WAL-backed transaction, recovery, MVCC
-  db.ts                   the Database facade
+  db.ts                   the Database facade (+ VACUUM / backup / dump)
+  async.ts                Promise-based AsyncDatabase
+  ddl.ts                  CREATE-statement reconstruction (VACUUM / dump)
+  statement.ts            prepared statements
+  kysely/                 Kysely dialect (published as minidb/kysely)
   repl.ts                 interactive shell
   bench/bench.ts          benchmarks
-tests/                    Vitest suites mirroring src/
-scripts/                  demo-pool, demo-crash, demo-explain
-docs/db-engine-spec.md    the original build spec
+tests/                    Vitest suites mirroring src/ (217 tests)
+examples/                 runnable usage examples
+scripts/                  demo-pool, demo-crash, demo-explain, bench-vs-sqlite
 ```
 
 ## Durability testing
@@ -244,14 +338,16 @@ meta-test confirms that in `off` mode a crash loses committed data).
 
 ## Known limitations (deliberate)
 
-Deferred reclamation, by design: deletes are **tombstones** (B+Tree entries and heap slots),
-B+Tree nodes are never merged or rebalanced, and rolled-back/dead versions leak space — a
-vacuum/compaction pass would reclaim all of it. Rows must fit within a single page (no overflow
-pages). Secondary indexes are on `INT` columns only. DDL inside an explicit transaction is
-rejected (it would desynchronize the in-memory catalog from an on-disk rollback). The engine is
-single-writer, enforced by an advisory PID lock — which, like any PID-file lock, can't fully
-disambiguate a recycled PID (a kernel `flock` would); it fails closed, never corrupting. There
-is no `JOIN` or `UPDATE` statement yet.
+Deletes are **tombstones** (B+Tree entries and heap slots) and B+Tree nodes are never merged
+or rebalanced; freed space (including dead overflow chains) is reclaimed by `VACUUM` rather than
+an incremental free list. Indexes — and therefore `PRIMARY KEY` / `UNIQUE` — are on `INT`
+columns only (B+Tree keys are 64-bit integers; string-keyed indexes are future work). The SQL
+path is **single-writer** with autocommit / `BEGIN`…`COMMIT`; the MVCC layer exists and is
+unit-tested but isn't wired into the executor yet. The query surface is intentionally a subset:
+no subqueries, CTEs, `OFFSET`, `RETURNING`, or `ON CONFLICT`; `ORDER BY` is single-column. DDL
+inside an explicit transaction is rejected (it would desynchronize the in-memory catalog from an
+on-disk rollback). The single-writer PID lock, like any PID-file lock, can't fully disambiguate a
+recycled PID (a kernel `flock` would); it fails closed, never corrupting.
 
 ## License
 
