@@ -1,14 +1,4 @@
 import {
-  closeSync,
-  existsSync,
-  fstatSync,
-  ftruncateSync,
-  openSync,
-  readSync,
-  writeSync,
-} from "node:fs";
-
-import {
   DB_FORMAT_VERSION,
   HEADER_CATALOG_ROOT_OFFSET,
   HEADER_MAGIC_OFFSET,
@@ -26,6 +16,7 @@ import {
 import { CorruptDatabaseError, PageError } from "../errors.js";
 import { crc32 } from "./crc32.js";
 import { Durability } from "./durability.js";
+import type { VfsFile } from "./vfs.js";
 
 /**
  * The lowest layer: turns one file into a sequence of fixed-size pages. Page 0
@@ -40,7 +31,7 @@ import { Durability } from "./durability.js";
  */
 export class Pager {
   private constructor(
-    private readonly fd: number,
+    private readonly file: VfsFile,
     readonly path: string,
     private readonly header: Buffer,
     private count: number,
@@ -49,10 +40,11 @@ export class Pager {
 
   /** Open an existing database file or create a fresh one. */
   static open(path: string, durability: Durability = new Durability()): Pager {
-    const existed = existsSync(path);
-    const fd = openSync(path, existed ? "r+" : "w+");
+    const vfs = durability.vfs;
+    const existed = vfs.exists(path);
+    const file = vfs.open(path);
 
-    const size = fstatSync(fd).size;
+    const size = file.size();
     if (!existed || size === 0) {
       const header = Buffer.alloc(PAGE_SIZE);
       header.write(MAGIC, HEADER_MAGIC_OFFSET, MAGIC_BYTES, "ascii");
@@ -62,49 +54,37 @@ export class Pager {
       header.writeUInt32LE(INVALID_PAGE, HEADER_CATALOG_ROOT_OFFSET);
       header.writeBigUInt64LE(1n, HEADER_NEXT_TXID_OFFSET); // txids start at 1
       stampChecksum(header);
-      writeSync(fd, header, 0, PAGE_SIZE, 0);
-      durability.barrier(fd, path);
+      file.writeAt(header, 0);
+      durability.barrier(file, path);
       durability.syncDir(path); // make the new file's directory entry durable
-      return new Pager(fd, path, header, 1, durability);
+      return new Pager(file, path, header, 1, durability);
     }
 
     const header = Buffer.alloc(PAGE_SIZE);
-    readSync(fd, header, 0, PAGE_SIZE, 0);
+    file.readAt(header, 0);
+    const fail = (message: string): never => {
+      file.close();
+      throw new CorruptDatabaseError(message);
+    };
     const magic = header.toString("ascii", HEADER_MAGIC_OFFSET, MAGIC_BYTES);
-    if (magic !== MAGIC) {
-      closeSync(fd);
-      throw new CorruptDatabaseError(
-        `not a minidb file: expected magic "${MAGIC}", found "${magic}"`,
-      );
-    }
+    if (magic !== MAGIC) fail(`not a minidb file: expected magic "${MAGIC}", found "${magic}"`);
     const storedVersion = header.readUInt16LE(HEADER_VERSION_OFFSET);
     if (storedVersion !== DB_FORMAT_VERSION) {
-      closeSync(fd);
-      throw new CorruptDatabaseError(
-        `format version mismatch: file is v${storedVersion}, engine is v${DB_FORMAT_VERSION}`,
-      );
+      fail(`format version mismatch: file is v${storedVersion}, engine is v${DB_FORMAT_VERSION}`);
     }
     const storedPageSize = header.readUInt16LE(HEADER_PAGE_SIZE_OFFSET);
     if (storedPageSize !== PAGE_SIZE) {
-      closeSync(fd);
-      throw new CorruptDatabaseError(
-        `page size mismatch: file uses ${storedPageSize}, engine uses ${PAGE_SIZE}`,
-      );
+      fail(`page size mismatch: file uses ${storedPageSize}, engine uses ${PAGE_SIZE}`);
     }
-    if (!verifyChecksum(header)) {
-      closeSync(fd);
-      throw new CorruptDatabaseError("database header failed its checksum (file corrupt)");
-    }
+    if (!verifyChecksum(header)) fail("database header failed its checksum (file corrupt)");
 
     // Drop any torn trailing page left by a crash mid-allocation; recovery will
     // rebuild whatever it needs from the WAL.
     let count = Math.floor(size / PAGE_SIZE);
     if (count < 1) count = 1;
-    if (size !== count * PAGE_SIZE) {
-      ftruncateSync(fd, count * PAGE_SIZE);
-    }
+    if (size !== count * PAGE_SIZE) file.truncate(count * PAGE_SIZE);
     header.writeUInt32LE(count, HEADER_PAGE_COUNT_OFFSET);
-    return new Pager(fd, path, header, count, durability);
+    return new Pager(file, path, header, count, durability);
   }
 
   /** Number of pages currently in the file (including the header page 0). */
@@ -143,7 +123,7 @@ export class Pager {
   }
 
   private readVerified(pageNo: number, into: Buffer): void {
-    const read = readSync(this.fd, into, 0, PAGE_SIZE, pageNo * PAGE_SIZE);
+    const read = this.file.readAt(into, pageNo * PAGE_SIZE);
     if (read !== PAGE_SIZE) {
       throw new PageError(`short read on page ${pageNo}: ${read}/${PAGE_SIZE} bytes`);
     }
@@ -166,17 +146,17 @@ export class Pager {
     if (pageNo === 0) {
       page.copy(this.header);
     }
-    const written = writeSync(this.fd, page, 0, PAGE_SIZE, pageNo * PAGE_SIZE);
+    const written = this.file.writeAt(page, pageNo * PAGE_SIZE);
     if (written !== PAGE_SIZE) {
       throw new PageError(`short write on page ${pageNo}: ${written}/${PAGE_SIZE} bytes`);
     }
-    if (sync) this.durability.barrier(this.fd, this.path);
+    if (sync) this.durability.barrier(this.file, this.path);
   }
 
   /** Grow the file by one zero-filled page and return its page number. */
   allocatePage(): number {
     const pageNo = this.count;
-    ftruncateSync(this.fd, (this.count + 1) * PAGE_SIZE);
+    this.file.truncate((this.count + 1) * PAGE_SIZE);
     this.count += 1;
     this.header.writeUInt32LE(this.count, HEADER_PAGE_COUNT_OFFSET);
     return pageNo;
@@ -190,7 +170,7 @@ export class Pager {
    */
   ensurePageCount(pages: number): void {
     if (pages <= this.count) return;
-    ftruncateSync(this.fd, pages * PAGE_SIZE);
+    this.file.truncate(pages * PAGE_SIZE);
     this.count = pages;
     this.header.writeUInt32LE(this.count, HEADER_PAGE_COUNT_OFFSET);
   }
@@ -198,8 +178,8 @@ export class Pager {
   /** Persist the in-memory header page to disk and fsync. */
   private writeHeader(): void {
     stampChecksum(this.header);
-    writeSync(this.fd, this.header, 0, PAGE_SIZE, 0);
-    this.durability.barrier(this.fd, this.path);
+    this.file.writeAt(this.header, 0);
+    this.durability.barrier(this.file, this.path);
   }
 
   /** Heap root page of the catalog (minidb_tables), or INVALID_PAGE if unset. */
@@ -226,13 +206,13 @@ export class Pager {
   sync(): void {
     // Keep the persisted page count current before forcing the file down.
     stampChecksum(this.header);
-    writeSync(this.fd, this.header, 0, PAGE_SIZE, 0);
-    this.durability.barrier(this.fd, this.path);
+    this.file.writeAt(this.header, 0);
+    this.durability.barrier(this.file, this.path);
   }
 
   close(): void {
     this.sync();
-    closeSync(this.fd);
+    this.file.close();
   }
 }
 

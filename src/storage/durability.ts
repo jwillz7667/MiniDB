@@ -1,5 +1,6 @@
-import { closeSync, fsyncSync, openSync } from "node:fs";
 import { dirname } from "node:path";
+
+import { nodeVfs, type Vfs, type VfsFile } from "./vfs.js";
 
 /**
  * Durability policy, centralized so every fsync flows through one seam.
@@ -28,45 +29,31 @@ export function setSyncFault(hook: ((path: string) => void) | null): void {
   faultHook = hook;
 }
 
-/** errno codes for platforms/filesystems that reject fsync on a directory handle. */
-const DIR_FSYNC_UNSUPPORTED = new Set(["EISDIR", "EINVAL", "EPERM", "EACCES", "EBADF"]);
-
 export class Durability {
-  constructor(readonly mode: SyncMode = "full") {}
+  constructor(
+    readonly mode: SyncMode = "full",
+    /** The storage backend; exposed so the pager and WAL open files through it. */
+    readonly vfs: Vfs = nodeVfs,
+  ) {}
 
   /** Hard durability barrier: write-ahead ordering and checkpoints depend on it. */
-  barrier(fd: number, path: string): void {
+  barrier(file: VfsFile, path: string): void {
     if (this.mode === "off") return;
     faultHook?.(path);
-    fsyncSync(fd);
+    file.sync();
   }
 
   /** Commit durability. Relaxed under `normal`, where it is deferred to the next barrier. */
-  commitBarrier(fd: number, path: string): void {
+  commitBarrier(file: VfsFile, path: string): void {
     if (this.mode !== "full") return;
     faultHook?.(path);
-    fsyncSync(fd);
+    file.sync();
   }
 
   /** Make a freshly created file's directory entry durable. */
   syncDir(filePath: string): void {
     if (this.mode === "off") return;
-    const dir = dirname(filePath);
-    let dirFd: number;
-    try {
-      dirFd = openSync(dir, "r");
-    } catch (err) {
-      if (DIR_FSYNC_UNSUPPORTED.has((err as NodeJS.ErrnoException).code ?? "")) return;
-      throw err;
-    }
-    try {
-      faultHook?.(dir); // crash injection also covers the directory fsync
-      fsyncSync(dirFd);
-    } catch (err) {
-      // Only swallow platform rejections; a real EIO/ENOSPC must surface.
-      if (!DIR_FSYNC_UNSUPPORTED.has((err as NodeJS.ErrnoException).code ?? "")) throw err;
-    } finally {
-      closeSync(dirFd);
-    }
+    faultHook?.(dirname(filePath)); // crash injection also covers the directory fsync
+    this.vfs.syncDir(filePath);
   }
 }

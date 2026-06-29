@@ -44,17 +44,29 @@ describe("durability modes", () => {
 
   it('"off" performs no fsync barriers; "full" does', () => {
     let hookCalls = 0;
+    let syncCalls = 0;
     setSyncFault(() => {
       hookCalls += 1;
     });
+    const file = {
+      readAt: () => 0,
+      writeAt: () => 0,
+      truncate: () => {},
+      size: () => 0,
+      sync: () => {
+        syncCalls += 1;
+      },
+      close: () => {},
+    };
 
     const off = new Durability("off");
-    off.barrier(-1, "x");
-    off.commitBarrier(-1, "x");
-    expect(hookCalls).toBe(0); // no real fsync attempted, so the hook never runs
+    off.barrier(file, "x");
+    off.commitBarrier(file, "x");
+    expect(hookCalls).toBe(0); // no barrier attempted, so neither the hook nor sync runs
+    expect(syncCalls).toBe(0);
 
-    // 'full' runs the hook, then fsync(-1) fails with EBADF — we only assert the hook ran.
-    expect(() => new Durability("full").barrier(-1, "x")).toThrow();
-    expect(hookCalls).toBe(1);
+    new Durability("full").barrier(file, "x");
+    expect(hookCalls).toBe(1); // the hook fires immediately before the real sync
+    expect(syncCalls).toBe(1);
   });
 });

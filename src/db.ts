@@ -1,5 +1,3 @@
-import { renameSync, rmSync } from "node:fs";
-
 import { INVALID_PAGE } from "./constants.js";
 import { reconstructCreateIndex, reconstructCreateTable } from "./ddl.js";
 import { TransactionError } from "./errors.js";
@@ -11,9 +9,10 @@ import { Catalog, type TableMeta } from "./record/catalog.js";
 import { BufferPool } from "./storage/bufferpool.js";
 import { Durability, type SyncMode } from "./storage/durability.js";
 import { Heap } from "./storage/heap.js";
-import { FileLock } from "./storage/lock.js";
+import { MemoryVfs } from "./storage/memory-vfs.js";
 import { Pager } from "./storage/pager.js";
 import { DirectTx } from "./storage/tx.js";
+import { nodeVfs, type Vfs, type VfsLock } from "./storage/vfs.js";
 import { parseMany, parsePrepared } from "./sql/parser.js";
 import { bindStatement, type BindValue } from "./sql/bind.js";
 import type { Statement } from "./sql/ast.js";
@@ -29,6 +28,8 @@ export interface DatabaseOptions {
   readonly synchronous?: SyncMode;
   /** Max rows an unbounded (no-LIMIT) ORDER BY may buffer before failing safe. */
   readonly maxSortRows?: number;
+  /** Storage backend. Defaults to the filesystem; pass a MemoryVfs to run in RAM. */
+  readonly vfs?: Vfs;
 }
 
 /** Result of a control statement plus everything the executor can return. */
@@ -81,8 +82,9 @@ export class Database {
   private constructor(
     engine: Engine,
     private readonly path: string,
-    private readonly lock: FileLock,
+    private readonly lock: VfsLock,
     private readonly options: DatabaseOptions,
+    private readonly vfs: Vfs,
     private readonly maxSortRows: number,
   ) {
     this.engine = engine;
@@ -91,20 +93,22 @@ export class Database {
   }
 
   static open(path: string, options: DatabaseOptions = {}): Database {
+    // The path ":memory:" (with no explicit backend) selects a fresh RAM store.
+    const vfs = options.vfs ?? (path === ":memory:" ? new MemoryVfs() : nodeVfs);
     // Refuse to open a file another live instance holds (would corrupt it).
-    const lock = FileLock.acquire(path);
+    const lock = vfs.acquireLock(path);
     try {
-      const engine = Database.buildEngine(path, options);
-      return new Database(engine, path, lock, options, options.maxSortRows ?? DEFAULT_MAX_SORT_ROWS);
+      const engine = Database.buildEngine(path, options, vfs);
+      return new Database(engine, path, lock, options, vfs, options.maxSortRows ?? DEFAULT_MAX_SORT_ROWS);
     } catch (err) {
       lock.release();
       throw err;
     }
   }
 
-  /** Open + recover the engine for `path`. Closes its fds if anything throws. */
-  private static buildEngine(path: string, options: DatabaseOptions): Engine {
-    const durability = new Durability(options.synchronous ?? "full");
+  /** Open + recover the engine for `path`. Closes its files if anything throws. */
+  private static buildEngine(path: string, options: DatabaseOptions, vfs: Vfs): Engine {
+    const durability = new Durability(options.synchronous ?? "full", vfs);
     const pager = Pager.open(path, durability);
     let wal: Wal | undefined;
     try {
@@ -286,19 +290,18 @@ export class Database {
     const pagesBefore = this.engine.pager.pageCount();
 
     const tmp = `${this.path}.vacuum-${process.pid}`;
-    for (const suffix of ["", "-wal", "-lock"]) rmSync(`${tmp}${suffix}`, { force: true });
+    for (const suffix of ["", "-wal", "-lock"]) this.vfs.delete(`${tmp}${suffix}`);
     this.copyInto(tmp);
 
     // Close the old engine (keeping our lock on `path`), put the compacted file
     // in its place, drop the now-stale WAL, and re-open in place.
     this.engine.wal.close();
     this.engine.pager.close();
-    renameSync(tmp, this.path);
-    rmSync(`${tmp}-wal`, { force: true });
-    rmSync(`${tmp}-lock`, { force: true });
-    rmSync(`${this.path}-wal`, { force: true });
+    this.vfs.rename(tmp, this.path);
+    this.vfs.delete(`${tmp}-wal`);
+    this.vfs.delete(`${this.path}-wal`);
 
-    this.engine = Database.buildEngine(this.path, this.options);
+    this.engine = Database.buildEngine(this.path, this.options, this.vfs);
     this.nextTxid =
       this.engine.recovery.maxTxid > 0n
         ? this.engine.recovery.maxTxid + 1n
@@ -334,7 +337,7 @@ export class Database {
 
   /** Build a compacted copy of this database at `targetPath` (live data only). */
   private copyInto(targetPath: string): void {
-    const dest = Database.open(targetPath, this.options);
+    const dest = Database.open(targetPath, { ...this.options, vfs: this.vfs });
     try {
       for (const table of this.engine.catalog.listTables()) {
         dest.exec(reconstructCreateTable(table));
